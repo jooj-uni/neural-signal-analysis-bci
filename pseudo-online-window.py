@@ -8,8 +8,8 @@ class PseudoOnlineWindow():
     os dados Raw devem ser extraídos do dataset com get_data() antes
     os outros parametros do init podem ser extraídos do objeto dataset também, a nao ser os params de window, que são definidos a gosto
 
-    um ponto importante é que ainda não tá muito claro como extrair os eventos do dataset, na classe levei em conta o array de eventos, típico do mne, mas não sei
-    como extrair isso no moabb.
+    ******* nao testei ainda!!!! pois ainda não tá muito claro pra mim como extrair os eventos do dataset no moabb, na classe levei em conta o array de eventos, típico do mne, mas não sei
+    como extrair isso no moabb ainda.
 
     acho que deve ter um jeito mais elegante de escrever esse codigo, mas por enquanto...
 
