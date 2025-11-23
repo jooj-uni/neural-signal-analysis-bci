@@ -1,17 +1,20 @@
 import numpy as np
 import moabb
 import mne
+from sklearn.metrics import matthew_corrcoef
+
 
 class PseudoOnlineWindow():
     """
-    a classe cria as janelas e as rotula baseado na proporção de imagética e não imagética
-    os dados Raw devem ser extraídos do dataset com get_data() antes
-    os outros parametros do init podem ser extraídos do objeto dataset também, a nao ser os params de window, que são definidos a gosto
-
-    ******* nao testei ainda!!!! pois ainda não tá muito claro pra mim como extrair os eventos do dataset no moabb, na classe levei em conta o array de eventos, típico do mne, mas não sei
-    como extrair isso no moabb ainda.
-
-    acho que deve ter um jeito mais elegante de escrever esse codigo, mas por enquanto...
+    cria janelas deslizantes e as rotula, baseado no arigo do framework pseudo online
+    os rotulos sao dados de acordo com a classe majoritaria da janela
+    ==============================
+    raw: objeto mne.Raw
+    events: array de eventos padrao do mne
+    interval: parametro do dataset que define os intervalos de imagetica
+    task_ids: define quais os ids das tasks que vao ser classificadas (permite problema multiclasse ou one-versus-rest, por exemplo)
+    window_size: define tamanho (em segundos) da janela
+    window_step: distancia entre os inicios de duas janelas adjacentes, entao define a sobreposicao entre janelas
 
     *******************************arrumar para logica funcionar por amostras e nao tempo************************************
     """
@@ -21,69 +24,187 @@ class PseudoOnlineWindow():
         self.interval = interval
         self.sfreq = raw.info['sfreq']
         self.task_ids = task_ids
-        self.window_size = window_size
-        self.window_step = window_step
 
-        #extrai tempos de começo e fim da imagetica (considerando um o periodo fixo de imagetica determinado no interval)
-        self.task_times = [
-            (ev[0] / self.sfreq + interval[0],
-             ev[0] / self.sfreq + interval[1],
-             ev[2])
-            for ev in events if ev[2] in task_ids
-        ]
+        self.window_size = int(window_size * self.sfreq)
+        self.window_step = int(window_step * self.sfreq)
+        self.t_start = int(interval[0] * self.sfreq)
+        self.t_end = int(interval[1] * self.sfreq)
+
+        self.labels = self.generate_labels
+
+    def generate_labels(self, start, stop):
+        """
+        atribui uma classe para cada amostra do dado. inicializa o vetor de rotulos em 0 e atribui a classe da task
+        às amostras do período de imagética
+        """
         
-        self.task_intervals = [(np.arange(t0, t1), ev) for t0, t1, ev in self.task_times]
+        #aqui n_sample eh de uma forma e la embaixo de outra
+        n_samples = self.raw.n_times
+        labels = np.zero(n_samples, dtype=int)
 
-    def label_window(self, start, stop):
+        valid_ids = list(self.event_id.values()) #vai selecionar so os eventos que queremos
+
+        for ev in self.events:
+            ev_idx, _, ev_id = ev
+
+            if ev_id in valid_ids:
+                # considera so o periodo de imagetica para rotular como task
+                start = ev_idx + self.t_start
+                stop = ev_idx + self.t_end
+
+                # garante limites do array
+                start = max(0, start)
+                stop = min(n_samples, stop)
+
+                labels[start:stop] = ev_id
+        return labels
+
+
+    def generate_windows(self):
         """
-        atribui os labels para cada janela
-            0: nothing -> se a maior parte nao representa imagetica
-            1: imagetica -> se a maior parte representa imagetica
-        se ambos os rotulos (nothing ou task_id) tiverem mesma proporcao, atribui para a janela o rotulo mais posterior 
-
-        a principio to considerando que vai acontecer de duas uma: o sujeito nao tenta controlar ou o sujeito tenta controlar, mas nao to considerando qual a imagetica que ele ta tentando performar, apenas se teve uma task (qualquer que seja)
-
-        ***** ainda da pra otimizar
-        ***** essa funcao leva em conta que uma janela vai conter no maximo uma task; precisa adaptar se for considerar janelas grandes o suficiente para abarcar mais de 1 task
-
+        gera janelas para todo o dado, alem de conter a logica de desempate de classe
+        return: array de dados das janelas X (shape=(2,)), array de labels y de cada janela, array de tempos em s de inicio de cada janela
         """
+        X, y, times = [], [], []
 
-        
-        window_times = np.arange(start, stop)#***********arrumar para calcular em amostras
+        data = self.raw.get_data()
+        #n_samples ta sendo obtido de outra forma la em cima
+        n_samples = data.shape[1]
 
-        nothing_qt = [p for p in window_times if not any(p in q for q, _ in self.task_intervals)]
-        nothing_prop = len(nothing_qt)/self.window_size
+        for start_idx in range (0, n_samples - self.window_size, self.window_step):
+            end_idx = start_idx + self.window_size
 
+            window_data = data[:, start_idx : end_idx]
+            window_labels = self.labels[start_idx:end_idx]
 
-        if nothing_prop > 0.5:
-            return 0
-        elif nothing_prop < 0.5:
-            for p in window_times:
-                for q, ev in self.task_intervals:
-                    if p in q: return ev
-        else:
-            for t0, _, ev_id in self.task_times:
-                return ev_id if t0 in window_times else 0 #se t0 ta em window_times, a task é a classe posterior; se t1 ta em window_times, nothing é posterior
+            count = np.bincount(window_labels)
+            major = np.argmax(count)
 
+            prop_major = count[major] / len(window_labels)
 
-    def generate_window(self):
-        X, Y, times = [], [], []
+            if prop_major != 0.5:
+                y.append(major)
+            #se ha empate, vence a classe posterior
+            else:
+                y.append(window_labels[-1])
 
-        """
-        loop para pegar os indices de inicios das janelas
-        o arange gera de 0 (inicio dos dados) ate tempo total (ultimo dado) - uma janela, para evitar acesso inválido
-        """
-        for start in np.arange(0, self.raw.times[-1] - self.window_size, self.window_step):
-            stop = start + self.window_size
+            X.append(window_data)
+            times.append(start_idx / self.sfreq)
 
-            data = self.raw.get_data(
-                start=int(start * self.sfreq),
-                stop=int(stop * self.sfreq)
-            )
+        return np.array(X), np.array(y), np.array(times)
 
-            label = self.label_window(start, stop)
-            X.append(data)
-            Y.append(label)
-            times.append((start, stop))
-        return np.array(X), np.array(Y), np.array(times)
+class PseudoOnlineEvaluation():
+    """
+    faz avaliacao com janelas deslizantes, tanto na mesma sessao quanto inter sessao.
+    =========================================
+    dataset: dataset utilizado
+    pipelines: dict de pipelines do moabb
+    method: pode ser 'within-session' para avaliacao na mesma sessao ou 'inter-session' para avaliacao entre sessoes
+        within session: treina nas primeiras k trials definidas por ratio e testa nas demais, dentro de uma unica sessao
+        inter session: treina nas prmeiras k sessoes definidas por ratio e testa nas demais sessoes
+    ratio: define a proporçao dos dados usada para treino
     
+    """
+    def __init__(self, dataset, pipelines, method, ratio=0.7):
+        self.dataset = dataset
+        self.pipelines = pipelines
+        self.ratio = 0.7
+        self.method = method
+        self.y_ = {}
+        self.mscores = {}
+    
+    def evaluate(self):
+        """
+        algumas questoes:
+            a extracao do array de events ainda nao ta clara e a funcao supoe ela. mesma coisa para task_ids
+            a extracao de dados de um dataset moabb ainda nao ta tao clara tambem
+
+        ********** checar os loops sobre dataset.get_data().items() e se ta trabalhando corretamente com objetos Raw *************
+        ********** atualizar o array de eventos quando append(raw)
+        """
+        events = []
+        task_ids = []
+        wsize = []
+        wstep = []
+
+        if self.method == 'within-session':
+            #checar se subject_id = subject_list
+            for subject in self.dataset.subject_list:
+                raw = []
+                pre = self.dataset.get_data(subject=subject)
+                #checar se a extracao de dados ta correta
+                for sess, run in pre.items():
+                    for run, data in run.items():
+                        raw.append(data)
+                        #aqui extracao de eventos
+                        wgen = PseudoOnlineWindow(raw=raw,
+                                                events=events,
+                                                task_ids=task_ids,
+                                                window_size=wsize,
+                                                window_step=wstep)
+                        X, y, times = wgen.generate_windows()
+
+                        idx_split = int(len(X) * self.ratio)
+
+                        X_train, y_train = X[:idx_split], y[:idx_split]
+                        X_test, y_test = X[idx_split:], y[idx_split:]
+
+                        for name, pipe in self.pipelines.items():
+                            pipe.fit(X_train, y_train)
+                            self.y_[name] = pipe.predict(X_test, y_test)
+
+                            self.mscores[name] = matthew_corrcoef(y_test, self.y_[name])
+
+        elif self.method == 'inter-session':
+            self.y_ = {}
+            self.mscores = {}
+            #checar se subject_id = subject_list
+            for subject in self.dataset.subject_list:
+                raw = []
+                pre = self.dataset.get_data(subject=subject)
+                keys = pre.keys()
+                idx_split = int(len(keys * self.ratio))
+
+                #checar se a extracao de dados ta correta
+                for sess, run in pre.items():
+                    if keys.index(sess) < idx_split:
+                        for data in run.items():
+                            raw.append(data)
+                
+                wgen_train = PseudoOnlineWindow(raw=raw,
+                                                events=events,
+                                                window_size=wsize,
+                                                window_step=wstep)
+                X_train, y_train, times_train = wgen_train.process()
+
+                for sess, run in pre.items():
+                    raw = []
+                    if keys.index(sess) >= idx_split:
+                        for data in run.items():
+                            raw.append(data)
+                        
+                        wgen_sesstest = PseudoOnlineWindow(raw=raw,
+                                                           events=events,
+                                                           window_size=wsize,
+                                                           window_step=wstep)
+                        X_sesstest, y_sesstest, times_sesstest = wgen_sesstest.process()
+
+                        for name, pipe in self.pipelines.items():
+                            pipe.fit(X_train, y_train)
+
+                            self.y_[sess][name] = pipe.predict(X_sesstest, y_sesstest)
+
+                            self.mscores[sess][name] = matthew_corrcoef(y_test, self.y_[sess][name])
+        return self.mscores
+        
+
+
+
+
+
+
+
+
+
+
+                    
