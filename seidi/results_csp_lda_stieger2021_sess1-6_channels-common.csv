@@ -1,7 +1,0 @@
-score,time,samples,subject,session,channels,n_sessions,dataset,pipeline
-0.68190473,0.09072723,205.0,1,1,7,11,Stieger2021,csp+lda
-0.8539569,0.03739233,200.0,1,2,7,11,Stieger2021,csp+lda
-0.6881667,0.039922573,203.0,1,3,7,11,Stieger2021,csp+lda
-0.935229,0.038666345,204.0,1,4,7,11,Stieger2021,csp+lda
-0.92820036,0.041326858,212.0,1,5,7,11,Stieger2021,csp+lda
-0.8892143,0.03853154,202.0,1,6,7,11,Stieger2021,csp+lda
