@@ -9,7 +9,7 @@ class PseudoOnlineWindow():
     """
     cria janelas deslizantes e as rotula, baseado no arigo do framework pseudo online
     os rotulos sao dados de acordo com a classe majoritaria da janela
-    ==============================
+
     raw: objeto mne.Raw
     events: array de eventos padrao do mne
     interval: parametro do dataset que define os intervalos de imagetica
@@ -98,7 +98,7 @@ class PseudoOnlineWindow():
 class PseudoOnlineEvaluation():
     """
     faz avaliacao com janelas deslizantes, tanto na mesma sessao quanto inter sessao.
-    =========================================
+
     dataset: dataset utilizado
     pipelines: dict de pipelines
     method: pode ser 'within-session' para avaliacao na mesma sessao ou 'inter-session' para avaliacao entre sessoes
@@ -119,6 +119,20 @@ class PseudoOnlineEvaluation():
         self.y_ = {}
         self.mscores = {}
 
+    def raw_concat(self, raw_list):
+        """
+        essa função garante que nao vai ter erro na concatenação dos raws, pro caso de a lista estar vazia, ter um só elemento, ou for uma lista com vários raws (como se é esperado)
+        """
+        if len(raw_list) == 0:
+            raise ValueError("A lista de raws está vazia")
+        elif len(raw_list) == 1:    #aqui, o raw de uma sessao pode ser constituido de 1 ou mais runs, por isso essa verificação
+            if type(raw_list[0]) != list:
+                return raw_list[0]
+            else:
+                return mne.concatenate_raws(raw_list[0])
+        else:
+            return mne.concatenate_raws(raw_list)
+
     def evaluate(self):
         """
         ******ainda precisa ser validado*******
@@ -129,32 +143,39 @@ class PseudoOnlineEvaluation():
         """
 
         for subject in self.dataset.subject_list:
+            print(f"Processando sujeito {subject}...")
+
             self.mscores[subject] = {}
             self.y_[subject] = {}
             raws_dict = {}
             raws_test = {}
-            pre = self.dataset.get_data(subject=[subject])
+            pre = self.dataset.get_data(subjects=[subject])
 
             """
             o within session faz split nas janelas, mas talvez o melhor seja fazer split como no inter-session (separar os raws de treino e teste antes de gerar janela)
             de todo modo, isso é tranquilo de mudar
             """
-
+            
+            session_keys = []   #armazenar os ids de sessoes (que nem sempre sao ints)
 
             if self.method == 'within-session':
                 
-                #o raw mesmo fica muito aninhado dentro do dict do get_data, entao tem que acessar uns 3 dicionarios ate chegar la
-                for sess, runs in pre.items():
-                    raws_dict[sess] = []
-                    for _, dicts in runs.items():
-                        for _, data in dicts.items():
-                            raws_dict[sess].append(data)
+                #o raw mesmo fica muito aninhado dentro do dict do get_data, entao tem que acessar uma penca de dicionario ate chegar la
+                for _, runs in pre.items():
+                    for sess in runs.keys():
+                        session_keys.append(sess)
+                        raws_dict[sess] = []
+                        for _, dicts in runs.items():
+                            for _, data in dicts.items():
+                                raws_dict[sess].append(data)
                 
-                for sess in pre.keys():
+                for sess in session_keys:
+                    print(f"Processando sessão {sess} sujeito {subject}...")
+
                     self.mscores[subject][sess] = {}
                     self.y_[subject][sess] = {}
                     
-                    raw = mne.concatenate_raws(raws_dict[sess]) #concatena todos os raws e gera o split depois
+                    raw = self.raw_concat(raws_dict[sess]) #concatena todos os raws e gera o split depois
                     events, event_ids = mne.events_from_annotations(raw)  #aqui da pra extrair o array de eventos pra usar no gerador de janelas
 
                     wgen = PseudoOnlineWindow(raw=raw,
@@ -179,51 +200,81 @@ class PseudoOnlineEvaluation():
                         self.mscores[subject][sess][name] = matthews_corrcoef(y_test, self.y_[subject][sess][name])
 
             elif self.method == 'inter-session':
-                #split de sessoes
-                session_split = int(self.ratio * self.dataset.n_sessions)
-                raws_dict = []
-                for sess, runs in pre.items():
-                    raws_test[sess] = []
-                    for _, dicts in runs.items():
-                        for _, data in dicts.items():
-                            if sess <= session_split:
-                                raws_dict.append(data)
+                if self.dataset.n_sessions > 1:
+                    #split de sessoes
+                    session_split = int(self.ratio * self.dataset.n_sessions)
+                    raws_list = []
+                    raws_train = []
+
+                    print(f"O índice de sessões de treino é {session_split}, o dataset possui {self.dataset.n_sessions} sessões por sujeito")
+
+                    for _, runs in pre.items():
+                        for sess in runs.keys():
+                            session_keys.append(sess)
+                            raws_test[sess] = []
+                            raws_dict[sess] = []
+                            for _, dicts in runs.items():
+                                for _, data in dicts.items():   #salva separado os dados de treino e de teste
+                                    raws_dict[sess].append(data)
+                    
+                    #essa verificação é porque eu acahva que o int() arredondava pra cima o valor... de todo jeito, nao faz mal deixar isso aqui
+                    if session_split == self.dataset.n_sessions:
+                        train_sessions = session_keys[:(session_split - 1)]
+                        test_sessions = session_keys[(session_split - 1):]
+                        for sess, data in raws_dict.items():
+                            if (session_keys.index(sess) + 1) < session_split:
+                                raws_list.append(data)
                             else:
                                 raws_test[sess].append(data)
-                        
-                raws_train = mne.concatenate_raws(raws_dict)
+                    else:
+                        train_sessions = session_keys[:session_split]
+                        test_sessions = session_keys[session_split:]
+                        for sess, data in raws_dict.items():
+                            if (session_keys.index(sess) + 1) <= session_split:
+                                raws_list.append(data)
+                            else:
+                                raws_test[sess].append(data)
+                    
+                    
+                    raws_train = self.raw_concat(raws_list)
+                    print("sessoes de treino concatenadas")
 
-                events, event_ids = mne.events_from_annotations(raws_train)
+                    events, event_ids = mne.events_from_annotations(raws_train)
 
-                wgen_train = PseudoOnlineWindow(raw=raws_train,
-                                                events=events,
-                                                interval=self.dataset.interval,
-                                                task_ids=event_ids,
-                                                window_size=self.wsize,
-                                                window_step=self.wstep
-                                                )
-
-                X_train, y_train, times_train = wgen_train.generate_windows()
-
-                for name, pipe in self.pipelines.items():
-                    pipe.fit(X_train, y_train)
-                    for sess in range(session_split + 1, self.dataset.n_sessions + 1): #assumindo sessoes indexadas de 1 a n
-                        self.mscores[subject][sess] = {}
-                        self.y_[subject][sess] = {}
-                        raws = mne.concatenate_raws(raws_test[sess])
-
-                        events, event_ids = mne.events_from_annotations(raws)
-
-                        wgen_test = PseudoOnlineWindow(raw=raws,
+                    wgen_train = PseudoOnlineWindow(raw=raws_train,
                                                         events=events,
                                                         interval=self.dataset.interval,
                                                         task_ids=event_ids,
                                                         window_size=self.wsize,
                                                         window_step=self.wstep
                                                         )
+
+                    X_train, y_train, times_train = wgen_train.generate_windows()
                         
-                        X_test, y_test, times_test = wgen_test.generate_windows()
+                    print(f"Treinando nas sessões {train_sessions}...")
 
-                        self.y_[subject][sess][name] = pipe.predict(X_test)
+                    for name, pipe in self.pipelines.items():
+                        pipe.fit(X_train, y_train)
+                        for sess in test_sessions:
+                            print(f"Testando na sessão {sess}...")
+                            self.mscores[subject][sess] = {}
+                            self.y_[subject][sess] = {}
+                            raws = self.raw_concat(raws_test[sess])
 
-                        self.mscores[subject][sess][name] = matthews_corrcoef(y_test, self.y_[subject][sess][name])
+                            events, event_ids = mne.events_from_annotations(raws)
+
+                            wgen_test = PseudoOnlineWindow(raw=raws,
+                                                                events=events,
+                                                                interval=self.dataset.interval,
+                                                                task_ids=event_ids,
+                                                                window_size=self.wsize,
+                                                                window_step=self.wstep
+                                                                )
+                                
+                            X_test, y_test, times_test = wgen_test.generate_windows()
+
+                            self.y_[subject][sess][name] = pipe.predict(X_test)
+
+                            self.mscores[subject][sess][name] = matthews_corrcoef(y_test, self.y_[subject][sess][name])
+                else:
+                    raise ValueError("Não há sessões suficientes para inter-session")
