@@ -2,6 +2,7 @@ import numpy as np
 import moabb
 import mne
 from sklearn.metrics import matthews_corrcoef
+import time
 
 
 
@@ -16,8 +17,6 @@ class PseudoOnlineWindow():
     task_ids: define quais os ids das tasks que vao ser classificadas (permite problema multiclasse ou one-versus-rest, por exemplo)
     window_size: define tamanho (em segundos) da janela
     window_step: distancia entre os inicios de duas janelas adjacentes, entao define a sobreposicao entre janelas
-
-    *******************************arrumar para logica funcionar por amostras e nao tempo************************************
     """
     def __init__(self, raw, events, interval, task_ids, window_size, window_step):
         self.raw = raw
@@ -90,7 +89,7 @@ class PseudoOnlineWindow():
                 y.append(window_labels[-1])
 
             X.append(window_data)
-            times.append(start_idx / self.sfreq)
+            times.append((start_idx / self.sfreq), (end_idx / self.sfreq))
 
         #um ponto importante a se checar é se o shape de X vai funcionar bem nos pipelines
         return np.array(X), np.array(y), np.array(times)
@@ -106,7 +105,6 @@ class PseudoOnlineEvaluation():
         inter session: treina nas prmeiras k sessoes definidas por ratio e testa nas demais sessoes
     ratio: define a proporçao dos dados usada para treino
     
-    ******no geral, ainda tá meio confuso e precisa de mais robustez******
     """
     def __init__(self, dataset, pipelines, method, wsize, wstep, ratio=0.7):
         self.dataset = dataset
@@ -115,9 +113,8 @@ class PseudoOnlineEvaluation():
         self.method = method
         self.wsize = wsize
         self.wstep = wstep
-
-        self.y_ = {}
-        self.mscores = {}
+        
+        self.results_ = []
 
     def raw_concat(self, raw_list):
         """
@@ -138,8 +135,6 @@ class PseudoOnlineEvaluation():
         ******ainda precisa ser validado*******
         ******adicionar verificacoes de erro e de tipos**********
         ******adicionar interpretabilidade e rastreabilidade*******      
-        ******adicionar um dataframe de resultados bonitinho********
-        ******falta verificar se o shape de X funciona nos pipelines********
         """
 
         for subject in self.dataset.subject_list:
@@ -171,10 +166,6 @@ class PseudoOnlineEvaluation():
                 
                 for sess in session_keys:
                     print(f"Processando sessão {sess} sujeito {subject}...")
-
-                    self.mscores[subject][sess] = {}
-                    self.y_[subject][sess] = {}
-                    
                     raw = self.raw_concat(raws_dict[sess]) #concatena todos os raws e gera o split depois
                     events, event_ids = mne.events_from_annotations(raw)  #aqui da pra extrair o array de eventos pra usar no gerador de janelas
 
@@ -190,14 +181,52 @@ class PseudoOnlineEvaluation():
 
                     idx_split = int(len(X) * self.ratio)
 
+                    times_test = times[idx_split:]
+
                     X_train, y_train = X[:idx_split], y[:idx_split]
                     X_test, y_test = X[idx_split:], y[idx_split:]
 
                     for name, pipe in self.pipelines.items():
-                        pipe.fit(X_train, y_train)
-                        self.y_[subject][sess][name] = pipe.predict(X_test)
+                        t_start = time.perf_counter()
 
-                        self.mscores[subject][sess][name] = matthews_corrcoef(y_test, self.y_[subject][sess][name])
+                        pipe.fit(X_train, y_train)
+
+                        t_end = time.perf_counter()
+                        t_train = t_end - t_start
+
+                        predictions = []
+                        mcc_acc = []
+
+                        for window in range(len(X_test) + 1):
+                            window_start = times_test[window][0]
+                            window_end = times_test[window][1]
+
+                            t_start = time.perf_counter()
+
+                            predictions[window] = pipe.predict(X_test)
+
+                            t_end = time.perf_counter()
+                            t_predict = t_end - t_start
+
+                            mcc_acc = matthews_corrcoef(y_test[:window+1], predictions[:window+1]) #score mcc acumulado até a janela
+
+                            res = {
+                                "dataset": self.dataset,
+                                "subject": subject,
+                                "session": sess,
+                                "pipeline": name,
+                                "t_train": t_train,
+                                "window": window,
+                                "window_start": window_start,
+                                "window_end": window_end,
+                                "t_predict": t_predict,
+                                "y_pred": predictions[window],
+                                "y_true": y_test[window],
+                                "correct": (predictions[window] == y_test[window]),
+                                "mcc_acc": mcc_acc
+                            }
+                            
+                            self.results_.apppend(res)
 
             elif self.method == 'inter-session':
                 if self.dataset.n_sessions > 1:
@@ -254,11 +283,20 @@ class PseudoOnlineEvaluation():
                     print(f"Treinando nas sessões {train_sessions}...")
 
                     for name, pipe in self.pipelines.items():
+                        t_start = time.perf_counter()
+
                         pipe.fit(X_train, y_train)
+
+                        t_end = time.perf_counter()
+                        t_train = t_end - t_start
+
+                        predictions = []
+                        y_all = []
+                        mcc_acc = []
+                        
                         for sess in test_sessions:
                             print(f"Testando na sessão {sess}...")
-                            self.mscores[subject][sess] = {}
-                            self.y_[subject][sess] = {}
+
                             raws = self.raw_concat(raws_test[sess])
 
                             events, event_ids = mne.events_from_annotations(raws)
@@ -273,8 +311,43 @@ class PseudoOnlineEvaluation():
                                 
                             X_test, y_test, times_test = wgen_test.generate_windows()
 
-                            self.y_[subject][sess][name] = pipe.predict(X_test)
+                            predictions_sess = []
 
-                            self.mscores[subject][sess][name] = matthews_corrcoef(y_test, self.y_[subject][sess][name])
+                            for window in range(len(X_test) + 1):
+                                #tempos de inicio e fim da janela, pode ser util pra plot
+                                window_start = times_test[window][0]
+                                window_end = times_test[window][1]
+
+
+                                t_start = time.perf_counter()
+                                predictions_sess[window] = pipe.predict(X_test[window])
+                                t_end = time.perf_counter()
+
+                                t_predict = t_end - t_start
+
+                                predictions.append(predictions_sess[window])
+                                y_all.append(y_test[window])
+
+                                mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
+                                mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
+
+                                res = {
+                                "dataset": self.dataset,
+                                "subject": subject,
+                                "session": sess,
+                                "pipeline": name,
+                                "t_train": t_train,
+                                "window": window,
+                                "window_start": window_start,
+                                "window_end": window_end,
+                                "t_predict": t_predict,
+                                "y_pred": predictions[window],
+                                "y_true": y[window],
+                                "correct": (predictions_sess[window] == y_test[window]),
+                                "mcc_acc_sess": mcc_acc_sess,
+                                "mcc_acc": mcc_acc
+                                }
+
+                                self.results_.apppend(res)
                 else:
                     raise ValueError("Não há sessões suficientes para inter-session")
