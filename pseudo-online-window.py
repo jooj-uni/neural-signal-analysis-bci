@@ -3,6 +3,8 @@ import moabb
 import mne
 from sklearn.metrics import matthews_corrcoef
 import time
+import matplotlib.pyplot as plt
+import pandas as pd
 
 
 
@@ -18,7 +20,7 @@ class PseudoOnlineWindow():
     window_size: define tamanho (em segundos) da janela
     window_step: distancia entre os inicios de duas janelas adjacentes, entao define a sobreposicao entre janelas
     """
-    def __init__(self, raw, events, interval, task_ids, window_size, window_step):
+    def __init__(self, raw, events, interval, task_ids, window_size, window_step, chan_list=None):
         self.raw = raw
         self.events = events
         self.interval = interval
@@ -27,6 +29,8 @@ class PseudoOnlineWindow():
 
         self.window_size = int(window_size * self.sfreq)
         self.window_step = int(window_step * self.sfreq)
+        self.chan_list = chan_list
+
         self.t_start = int(interval[0] * self.sfreq)
         self.t_end = int(interval[1] * self.sfreq)
 
@@ -74,22 +78,35 @@ class PseudoOnlineWindow():
         for start_idx in range (0, n_samples - self.window_size, self.window_step):
             end_idx = start_idx + self.window_size
 
-            window_data = data[:, start_idx : end_idx]
-            window_labels = self.labels[start_idx:end_idx]
+            if self.chan_list == None:
+                window_data = data[:, start_idx : end_idx]
+                window_labels = self.labels[start_idx:end_idx]
+            else:       #seleçao de canais
+                window_data = []
+                for chan in self.chan_list:
+                    if chan in self.raw.ch_names:
+                        window_data.append(data[chan, start_idx : end_idx])
+                    else:
+                        raise ValueError(f"Canal {chan} não está na lista {self.raw.ch_names}")
+                window_labels = self.labels[start_idx:end_idx]
 
             count = np.bincount(window_labels)
             major = np.argmax(count)
 
             prop_major = count[major] / len(window_labels)
 
-            if prop_major != 0.5:
+            #define a proporcao de empate
+            n_classes = len(np.unique(window_labels))
+            draw_prop = 1 / n_classes
+
+            if prop_major != draw_prop:
                 y.append(major)
-            #se ha empate, vence a classe posterior; isso aqui so trata do caso de haver apenas duas classes (rest e uma task) na janela
+            #se ha empate, vence a classe posterior; acho que agora ta tratando de quaisquer qtd de classes na janela
             else:
                 y.append(window_labels[-1])
 
             X.append(window_data)
-            times.append((start_idx / self.sfreq), (end_idx / self.sfreq))
+            times.append(((start_idx / self.sfreq), (end_idx / self.sfreq)))
 
         #um ponto importante a se checar é se o shape de X vai funcionar bem nos pipelines
         return np.array(X), np.array(y), np.array(times)
@@ -106,13 +123,14 @@ class PseudoOnlineEvaluation():
     ratio: define a proporçao dos dados usada para treino
     
     """
-    def __init__(self, dataset, pipelines, method, wsize, wstep, ratio=0.7):
+    def __init__(self, dataset, pipelines, method, wsize, wstep, subjects, ratio=0.7):
         self.dataset = dataset
         self.pipelines = pipelines
         self.ratio = ratio
         self.method = method
         self.wsize = wsize
         self.wstep = wstep
+        self.subjects = subjects
         
         self.results_ = []
 
@@ -137,217 +155,238 @@ class PseudoOnlineEvaluation():
         ******adicionar interpretabilidade e rastreabilidade*******      
         """
 
-        for subject in self.dataset.subject_list:
-            print(f"Processando sujeito {subject}...")
+        for subject in self.subjects:
+            if subject not in self.dataset.subject_list:
+                raise ValueError(f"Índice de sujeito inválido: {subject}")
+            else:
+                print(f"Processando sujeito {subject}...")
 
-            self.mscores[subject] = {}
-            self.y_[subject] = {}
-            raws_dict = {}
-            raws_test = {}
-            pre = self.dataset.get_data(subjects=[subject])
+                raws_dict = {}
+                raws_test = {}
+                pre = self.dataset.get_data(subjects=[subject])
 
-            """
-            o within session faz split nas janelas, mas talvez o melhor seja fazer split como no inter-session (separar os raws de treino e teste antes de gerar janela)
-            de todo modo, isso é tranquilo de mudar
-            """
-            
-            session_keys = []   #armazenar os ids de sessoes (que nem sempre sao ints)
-
-            if self.method == 'within-session':
+                """
+                o within session faz split nas janelas, mas talvez o melhor seja fazer split como no inter-session (separar os raws de treino e teste antes de gerar janela)
+                de todo modo, isso é tranquilo de mudar
+                """
                 
-                #o raw mesmo fica muito aninhado dentro do dict do get_data, entao tem que acessar uma penca de dicionario ate chegar la
-                for _, runs in pre.items():
-                    for sess in runs.keys():
-                        session_keys.append(sess)
-                        raws_dict[sess] = []
-                        for _, dicts in runs.items():
-                            for _, data in dicts.items():
-                                raws_dict[sess].append(data)
-                
-                for sess in session_keys:
-                    print(f"Processando sessão {sess} sujeito {subject}...")
-                    raw = self.raw_concat(raws_dict[sess]) #concatena todos os raws e gera o split depois
-                    events, event_ids = mne.events_from_annotations(raw)  #aqui da pra extrair o array de eventos pra usar no gerador de janelas
+                session_keys = []   #armazenar os ids de sessoes (que nem sempre sao ints)
 
-                    wgen = PseudoOnlineWindow(raw=raw,
-                                              events=events,
-                                              interval=self.dataset.interval,
-                                              task_ids=event_ids,
-                                              window_size=self.wsize,
-                                              window_step=self.wstep
-                                              )
+                if self.method == 'within-session':
                     
-                    X, y, times = wgen.generate_windows()   #o times pode ser usado depois pra plot, etc
-
-                    idx_split = int(len(X) * self.ratio)
-
-                    times_test = times[idx_split:]
-
-                    X_train, y_train = X[:idx_split], y[:idx_split]
-                    X_test, y_test = X[idx_split:], y[idx_split:]
-
-                    for name, pipe in self.pipelines.items():
-                        t_start = time.perf_counter()
-
-                        pipe.fit(X_train, y_train)
-
-                        t_end = time.perf_counter()
-                        t_train = t_end - t_start
-
-                        predictions = []
-                        mcc_acc = []
-
-                        for window in range(len(X_test) + 1):
-                            window_start = times_test[window][0]
-                            window_end = times_test[window][1]
-
-                            t_start = time.perf_counter()
-
-                            predictions[window] = pipe.predict(X_test)
-
-                            t_end = time.perf_counter()
-                            t_predict = t_end - t_start
-
-                            mcc_acc = matthews_corrcoef(y_test[:window+1], predictions[:window+1]) #score mcc acumulado até a janela
-
-                            res = {
-                                "dataset": self.dataset,
-                                "subject": subject,
-                                "session": sess,
-                                "pipeline": name,
-                                "t_train": t_train,
-                                "window": window,
-                                "window_start": window_start,
-                                "window_end": window_end,
-                                "t_predict": t_predict,
-                                "y_pred": predictions[window],
-                                "y_true": y_test[window],
-                                "correct": (predictions[window] == y_test[window]),
-                                "mcc_acc": mcc_acc
-                            }
-                            
-                            self.results_.apppend(res)
-
-            elif self.method == 'inter-session':
-                if self.dataset.n_sessions > 1:
-                    #split de sessoes
-                    session_split = int(self.ratio * self.dataset.n_sessions)
-                    raws_list = []
-                    raws_train = []
-
-                    print(f"O índice de sessões de treino é {session_split}, o dataset possui {self.dataset.n_sessions} sessões por sujeito")
-
+                    #o raw mesmo fica muito aninhado dentro do dict do get_data, entao tem que acessar uma penca de dicionario ate chegar la
                     for _, runs in pre.items():
                         for sess in runs.keys():
                             session_keys.append(sess)
-                            raws_test[sess] = []
                             raws_dict[sess] = []
                             for _, dicts in runs.items():
-                                for _, data in dicts.items():   #salva separado os dados de treino e de teste
+                                for _, data in dicts.items():
                                     raws_dict[sess].append(data)
                     
-                    #essa verificação é porque eu acahva que o int() arredondava pra cima o valor... de todo jeito, nao faz mal deixar isso aqui
-                    if session_split == self.dataset.n_sessions:
-                        train_sessions = session_keys[:(session_split - 1)]
-                        test_sessions = session_keys[(session_split - 1):]
-                        for sess, data in raws_dict.items():
-                            if (session_keys.index(sess) + 1) < session_split:
-                                raws_list.append(data)
-                            else:
-                                raws_test[sess].append(data)
-                    else:
-                        train_sessions = session_keys[:session_split]
-                        test_sessions = session_keys[session_split:]
-                        for sess, data in raws_dict.items():
-                            if (session_keys.index(sess) + 1) <= session_split:
-                                raws_list.append(data)
-                            else:
-                                raws_test[sess].append(data)
-                    
-                    
-                    raws_train = self.raw_concat(raws_list)
-                    print("sessoes de treino concatenadas")
+                    for sess in session_keys:
+                        print(f"Processando sessão {sess} sujeito {subject}...")
+                        raw = self.raw_concat(raws_dict[sess]) #concatena todos os raws e gera o split depois
+                        events, event_ids = mne.events_from_annotations(raw)  #aqui da pra extrair o array de eventos pra usar no gerador de janelas
 
-                    events, event_ids = mne.events_from_annotations(raws_train)
-
-                    wgen_train = PseudoOnlineWindow(raw=raws_train,
-                                                        events=events,
-                                                        interval=self.dataset.interval,
-                                                        task_ids=event_ids,
-                                                        window_size=self.wsize,
-                                                        window_step=self.wstep
-                                                        )
-
-                    X_train, y_train, times_train = wgen_train.generate_windows()
+                        wgen = PseudoOnlineWindow(raw=raw,
+                                                events=events,
+                                                interval=self.dataset.interval,
+                                                task_ids=event_ids,
+                                                window_size=self.wsize,
+                                                window_step=self.wstep
+                                                )
                         
-                    print(f"Treinando nas sessões {train_sessions}...")
+                        X, y, times = wgen.generate_windows()   #o times pode ser usado depois pra plot, etc
 
-                    for name, pipe in self.pipelines.items():
-                        t_start = time.perf_counter()
+                        idx_split = int(len(X) * self.ratio)
 
-                        pipe.fit(X_train, y_train)
+                        times_test = times[idx_split:]
 
-                        t_end = time.perf_counter()
-                        t_train = t_end - t_start
+                        X_train, y_train = X[:idx_split], y[:idx_split]
+                        X_test, y_test = X[idx_split:], y[idx_split:]
 
-                        predictions = []
-                        y_all = []
-                        mcc_acc = []
-                        
-                        for sess in test_sessions:
-                            print(f"Testando na sessão {sess}...")
+                        for name, pipe in self.pipelines.items():
+                            t_start = time.perf_counter()
 
-                            raws = self.raw_concat(raws_test[sess])
+                            pipe.fit(X_train, y_train)
 
-                            events, event_ids = mne.events_from_annotations(raws)
+                            t_end = time.perf_counter()
+                            t_train = t_end - t_start
 
-                            wgen_test = PseudoOnlineWindow(raw=raws,
-                                                                events=events,
-                                                                interval=self.dataset.interval,
-                                                                task_ids=event_ids,
-                                                                window_size=self.wsize,
-                                                                window_step=self.wstep
-                                                                )
-                                
-                            X_test, y_test, times_test = wgen_test.generate_windows()
+                            predictions = []
+                            mcc_acc = []
 
-                            predictions_sess = []
-
-                            for window in range(len(X_test) + 1):
-                                #tempos de inicio e fim da janela, pode ser util pra plot
+                            for window in range(len(X_test)):
                                 window_start = times_test[window][0]
                                 window_end = times_test[window][1]
 
-
                                 t_start = time.perf_counter()
-                                predictions_sess[window] = pipe.predict(X_test[window])
-                                t_end = time.perf_counter()
 
+                                y_pred = pipe.predict([X_test[window]])[0]
+                                predictions.append(y_pred)
+
+                                t_end = time.perf_counter()
                                 t_predict = t_end - t_start
 
-                                predictions.append(predictions_sess[window])
-                                y_all.append(y_test[window])
-
-                                mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
-                                mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
+                                mcc_acc = matthews_corrcoef(y_test[:window+1], predictions[:window+1]) #score mcc acumulado até a janela
 
                                 res = {
-                                "dataset": self.dataset,
-                                "subject": subject,
-                                "session": sess,
-                                "pipeline": name,
-                                "t_train": t_train,
-                                "window": window,
-                                "window_start": window_start,
-                                "window_end": window_end,
-                                "t_predict": t_predict,
-                                "y_pred": predictions[window],
-                                "y_true": y[window],
-                                "correct": (predictions_sess[window] == y_test[window]),
-                                "mcc_acc_sess": mcc_acc_sess,
-                                "mcc_acc": mcc_acc
+                                    "dataset": self.dataset,
+                                    "subject": subject,
+                                    "session": sess,
+                                    "pipeline": name,
+                                    "t_train": t_train,
+                                    "window": window,
+                                    "window_start": window_start,
+                                    "window_end": window_end,
+                                    "t_predict": t_predict,
+                                    "y_pred": y_pred,
+                                    "y_true": y_test[window],
+                                    "correct": (predictions[window] == y_test[window]),
+                                    "mcc_acc": mcc_acc
                                 }
+                                
+                                self.results_.append(res)
 
-                                self.results_.apppend(res)
-                else:
-                    raise ValueError("Não há sessões suficientes para inter-session")
+                elif self.method == 'inter-session':
+                    if self.dataset.n_sessions > 1:
+                        #split de sessoes
+                        session_split = int(self.ratio * self.dataset.n_sessions)
+                        raws_list = []
+                        raws_train = []
+
+                        print(f"O índice de sessões de treino é {session_split}, o dataset possui {self.dataset.n_sessions} sessões por sujeito")
+
+                        for _, runs in pre.items():
+                            for sess in runs.keys():
+                                session_keys.append(sess)
+                                raws_test[sess] = []
+                                raws_dict[sess] = []
+                                for _, dicts in runs.items():
+                                    for _, data in dicts.items():   #salva separado os dados de treino e de teste
+                                        raws_dict[sess].append(data)
+                        
+                        #essa verificação é porque eu acahva que o int() arredondava pra cima o valor... de todo jeito, nao faz mal deixar isso aqui
+                        if session_split == self.dataset.n_sessions:
+                            train_sessions = session_keys[:(session_split - 1)]
+                            test_sessions = session_keys[(session_split - 1):]
+                            for sess, data in raws_dict.items():
+                                if (session_keys.index(sess) + 1) < session_split:
+                                    raws_list.append(data)
+                                else:
+                                    raws_test[sess].append(data)
+                        else:
+                            train_sessions = session_keys[:session_split]
+                            test_sessions = session_keys[session_split:]
+                            for sess, data in raws_dict.items():
+                                if (session_keys.index(sess) + 1) <= session_split:
+                                    raws_list.append(data)
+                                else:
+                                    raws_test[sess].append(data)
+                        
+                        
+                        raws_train = self.raw_concat(raws_list)
+                        print("sessoes de treino concatenadas")
+
+                        events, event_ids = mne.events_from_annotations(raws_train)
+
+                        wgen_train = PseudoOnlineWindow(raw=raws_train,
+                                                            events=events,
+                                                            interval=self.dataset.interval,
+                                                            task_ids=event_ids,
+                                                            window_size=self.wsize,
+                                                            window_step=self.wstep
+                                                            )
+
+                        X_train, y_train, times_train = wgen_train.generate_windows()
+                            
+                        print(f"Treinando nas sessões {train_sessions}...")
+
+                        for name, pipe in self.pipelines.items():
+                            t_start = time.perf_counter()
+
+                            pipe.fit(X_train, y_train)
+
+                            t_end = time.perf_counter()
+                            t_train = t_end - t_start
+
+                            predictions = []
+                            y_all = []
+                            mcc_acc = []
+                            
+                            for sess in test_sessions:
+                                print(f"Testando na sessão {sess}...")
+
+                                raws = self.raw_concat(raws_test[sess])
+
+                                events, event_ids = mne.events_from_annotations(raws)
+
+                                wgen_test = PseudoOnlineWindow(raw=raws,
+                                                                    events=events,
+                                                                    interval=self.dataset.interval,
+                                                                    task_ids=event_ids,
+                                                                    window_size=self.wsize,
+                                                                    window_step=self.wstep
+                                                                    )
+                                    
+                                X_test, y_test, times_test = wgen_test.generate_windows()
+
+                                predictions_sess = []
+
+                                print("X_train:", len(X_train), "X_test:", len(X_test))
+                                print("y_train:", len(y_train), "y_test:", len(y_test))
+
+
+                                for window in range(len(X_test)):
+                                    #tempos de inicio e fim da janela, pode ser util pra plot
+                                    window_start = times_test[window][0]
+                                    window_end = times_test[window][1]
+
+
+                                    t_start = time.perf_counter()
+                                    y_pred = pipe.predict([X_test[window]])[0]
+                                    t_end = time.perf_counter()
+
+                                    t_predict = t_end - t_start
+
+                                    predictions_sess.append(y_pred)
+                                    predictions.append(y_pred)
+                                    y_all.append(y_test[window])
+
+                                    mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
+                                    mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
+
+                                    res = {
+                                    "dataset": self.dataset,
+                                    "subject": subject,
+                                    "session": sess,
+                                    "pipeline": name,
+                                    "t_train": t_train,
+                                    "window": window,
+                                    "window_start": window_start,
+                                    "window_end": window_end,
+                                    "t_predict": t_predict,
+                                    "y_pred": y_pred,
+                                    "y_true": y[window],
+                                    "correct": (predictions_sess[window] == y_test[window]),
+                                    "mcc_acc_sess": mcc_acc_sess,
+                                    "mcc_acc": mcc_acc
+                                    }
+
+                                    self.results_.append(res)
+                    else:
+                        raise ValueError("Não há sessões suficientes para inter-session")
+        if len(self.results_):
+            self.results_ = pd.DataFrame(self.results_)
+            self.results_.to_csv("pseudo-online-results.csv", index=False)
+
+def plot_scores (df):
+    df_sorted = df.sort_values("window")
+
+    plt.figure(figsize=(25,10))
+    plt.plot(df_sorted["window"], df_sorted["mcc_acc"], marker='o')
+    plt.xlabel("Janela")
+    plt.ylabel("MCC acumulado")
+    plt.title("Evolução do MCC acumulado ao longo das janelas")
+    plt.grid(True)
+    plt.show()
