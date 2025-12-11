@@ -367,7 +367,7 @@ class PseudoOnlineEvaluation():
                                     "window_end": window_end,
                                     "t_predict": t_predict,
                                     "y_pred": y_pred,
-                                    "y_true": y[window],
+                                    "y_true": y_test[window],
                                     "correct": (predictions_sess[window] == y_test[window]),
                                     "mcc_acc_sess": mcc_acc_sess,
                                     "mcc_acc": mcc_acc
@@ -379,14 +379,3 @@ class PseudoOnlineEvaluation():
         if len(self.results_):
             self.results_ = pd.DataFrame(self.results_)
             self.results_.to_csv("pseudo-online-results.csv", index=False)
-
-def plot_scores (df):
-    df_sorted = df.sort_values("window")
-
-    plt.figure(figsize=(25,10))
-    plt.plot(df_sorted["window"], df_sorted["mcc_acc"], marker='o')
-    plt.xlabel("Janela")
-    plt.ylabel("MCC acumulado")
-    plt.title("Evolução do MCC acumulado ao longo das janelas")
-    plt.grid(True)
-    plt.show()
