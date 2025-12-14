@@ -118,13 +118,13 @@ def heatmap(ax, M, xticks, yticks, title, xlabel, ylabel, vmin=0.0, vmax=1.0):
     cb   = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Accuracy")
     cb.ax.tick_params(labelsize=9)
     ax.set_xticks(np.arange(len(xticks)))
-    ax.set_xticklabels(xticks, rotation=25, ha="right", fontsize=10)
+    ax.set_xticklabels(xticks, rotation=90, ha="right", fontsize=8)
     ax.set_yticks(np.arange(len(yticks)))
-    ax.set_yticklabels(yticks, fontsize=10)
+    ax.set_yticklabels(yticks, fontsize=8)
     ax.set_title(title, fontsize=12)
-    ax.set_xlabel(xlabel, fontsize=11)
-    ax.set_ylabel(ylabel, fontsize=11)
-    annotate_heatmap(ax, arr, fontsize=10)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    annotate_heatmap(ax, arr, fontsize=8)
 
 # -----------------------
 # FIGURA PRINCIPAL
