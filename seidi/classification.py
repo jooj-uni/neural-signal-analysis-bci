@@ -1,12 +1,9 @@
-# ============================================================
-# IMPORTS
-# ============================================================
 import os, re, inspect, warnings, time
 import numpy as np
 import pandas as pd
-import mne, moabb
+import moabb
 
-from typing import List, Dict
+from typing import List
 from moabb.paradigms import MotorImagery
 from moabb.evaluations import WithinSessionEvaluation
 from moabb.datasets import Stieger2021
@@ -27,18 +24,18 @@ from scipy import signal
 warnings.filterwarnings("ignore")
 moabb.set_log_level("info")
 
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
+# ---- Config ----
 DATA_DIR          = r"D:\dados_stieger"
 SUBJECTS          = list(range(1, 5))
-SESSIONS_USE      = [1, 3, 7]
+SESSIONS_USE      = [1, 2, 3, 4, 5, 6, 7]
 INTERVAL          = [0.5, 2.5]
 RESAMPLE_HZ       = 128
-FMIN, FMAX        = 0.5, 50.0
+FMIN, FMAX        = 0.5, 45.0
 OUT_CSV           = "results_stieger2021_full.csv"
 
-PSD_FMIN, PSD_FMAX = 8.0, 30.0
+COH_FMIN, COH_FMAX = 8.0, 30.0
+COH_NPERSEG        = None
+COH_NOVERLAP       = None
 
 TARGET_21 = [
     "FC3","FC1","FCz","FC2","FC4",
@@ -52,16 +49,16 @@ BASE_PIPELINE_NAMES = [
     "riem+svm_lin","riem+svm_rbf"
 ]
 
-PSD_PIPELINE_NAMES = [
-    "psd_riem+lda","psd_riem+lr",
-    "psd_riem+svm_lin","psd_riem+svm_rbf"
+COH_PIPELINE_NAMES = [
+    "cohpeak+lda","cohpeak+lr",
+    "cohpeak+svm_lin","cohpeak+svm_rbf"
 ]
 
 # ============================================================
-# DATASET LOCAL
+# Dataset local
 # ============================================================
 class Stieger2021Local(Stieger2021):
-    def __init__(self, interval=[0,3], sessions=None, fix_bads=True, data_dir=None):
+    def __init__(self, interval=[0, 3], sessions=None, fix_bads=True, data_dir=None):
         sig = inspect.signature(super().__init__)
         if "fix_bads" in sig.parameters:
             super().__init__(interval=interval, sessions=sessions, fix_bads=fix_bads)
@@ -74,16 +71,17 @@ class Stieger2021Local(Stieger2021):
             return []
         files = []
         for fname in os.listdir(self.data_dir):
-            if fname.endswith(".mat"):
-                m = re.match(r"S(\d+)_Session_(\d+)\.mat", fname)
-                if m and int(m.group(1)) == subject:
-                    ses = int(m.group(2))
-                    if self.sessions is None or ses in self.sessions:
-                        files.append(os.path.join(self.data_dir, fname))
+            if not fname.endswith(".mat"):
+                continue
+            m = re.match(r"S(\d+)_Session_(\d+)\.mat", fname)
+            if m and int(m.group(1)) == subject:
+                ses = int(m.group(2))
+                if self.sessions is None or ses in self.sessions:
+                    files.append(os.path.join(self.data_dir, fname))
         return sorted(files)
 
 # ============================================================
-# TRANSFORMERS
+# Transformers
 # ============================================================
 class CAR(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None): return self
@@ -91,47 +89,51 @@ class CAR(BaseEstimator, TransformerMixin):
         X = np.asarray(X)
         return X - X.mean(axis=1, keepdims=True)
 
-
-class PSDCovariances(BaseEstimator, TransformerMixin):
+class CoherencePeakFeatures(BaseEstimator, TransformerMixin):
     """
-    PSD → SPD (com projeção SPD explícita)
+    Para cada trial:
+      - coerência entre todos os pares
+      - pico (máximo) na banda vira feature do par
+    Retorna: (n_trials, n_pairs)
     """
-    def __init__(self, sfreq, fmin, fmax, reg=1e-6):
-        self.sfreq = sfreq
-        self.fmin  = fmin
-        self.fmax  = fmax
-        self.reg   = reg
+    def __init__(self, sfreq, fmin=8.0, fmax=30.0, nperseg=None, noverlap=None):
+        self.sfreq = float(sfreq)
+        self.fmin = float(fmin)
+        self.fmax = float(fmax)
+        self.nperseg = nperseg
+        self.noverlap = noverlap
 
     def fit(self, X, y=None):
         return self
 
+    @staticmethod
+    def _pairs(n_ch):
+        return [(i, j) for i in range(n_ch - 1) for j in range(i + 1, n_ch)]
+
     def transform(self, X):
         X = np.asarray(X)
         n_trials, n_ch, _ = X.shape
-        covmats = np.zeros((n_trials, n_ch, n_ch))
+        pairs = self._pairs(n_ch)
+        feats = np.zeros((n_trials, len(pairs)), dtype=np.float32)
 
-        for i in range(n_trials):
-            freqs, psd = signal.welch(
-                X[i], fs=self.sfreq, axis=-1,
-                detrend="constant", scaling="density"
-            )
-            band = (freqs >= self.fmin) & (freqs <= self.fmax)
-            P = np.log(psd[:, band] + 1e-20)
+        for t in range(n_trials):
+            Xt = X[t]
+            for k, (i, j) in enumerate(pairs):
+                f, Cxy = signal.coherence(
+                    Xt[i], Xt[j],
+                    fs=self.sfreq,
+                    nperseg=self.nperseg,
+                    noverlap=self.noverlap,
+                    detrend="constant",
+                )
+                band = (f >= self.fmin) & (f <= self.fmax)
+                feats[t, k] = float(np.nanmax(Cxy[band])) if np.any(band) else 0.0
 
-            C = np.cov(P, bias=False)
-            C = 0.5 * (C + C.T)
-
-            # projeção SPD explícita
-            eigvals, eigvecs = np.linalg.eigh(C)
-            eigvals[eigvals < 1e-6] = 1e-6
-            C = eigvecs @ np.diag(eigvals) @ eigvecs.T
-
-            covmats[i] = C + self.reg * np.eye(n_ch)
-
-        return covmats
+        feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+        return feats
 
 # ============================================================
-# PIPELINES
+# Pipelines
 # ============================================================
 def build_base_pipelines():
     car = CAR()
@@ -144,53 +146,48 @@ def build_base_pipelines():
         "csp+lda": make_pipeline(car, csp, LDA()),
         "csp+lr" : make_pipeline(car, csp, LogisticRegression(max_iter=500)),
 
-        "riem+lda": Pipeline([
-            ("car",car),("cov",cov),("ts",ts),("clf",LDA())
-        ]),
-        "riem+lr": Pipeline([
-            ("car",car),("cov",cov),("ts",ts),
-            ("clf",LogisticRegression(max_iter=500))
-        ]),
-        "riem+svm_lin": Pipeline([
-            ("car",car),("cov",cov),("ts",ts),
-            ("sc",StandardScaler()),
-            ("clf",SVC(kernel="linear"))
-        ]),
-        "riem+svm_rbf": Pipeline([
-            ("car",car),("cov",cov),("ts",ts),
-            ("sc",StandardScaler()),
-            ("clf",SVC(kernel="rbf", gamma="scale"))
-        ]),
+        "riem+lda": Pipeline([("car",car),("cov",cov),("ts",ts),("clf",LDA())]),
+        "riem+lr":  Pipeline([("car",car),("cov",cov),("ts",ts),
+                              ("clf",LogisticRegression(max_iter=500))]),
+        "riem+svm_lin": Pipeline([("car",car),("cov",cov),("ts",ts),
+                                  ("sc",StandardScaler()),
+                                  ("clf",SVC(kernel="linear"))]),
+        "riem+svm_rbf": Pipeline([("car",car),("cov",cov),("ts",ts),
+                                  ("sc",StandardScaler()),
+                                  ("clf",SVC(kernel="rbf", gamma="scale"))]),
     }
 
+def build_coh_feature_extractor():
+    return Pipeline([
+        ("car", CAR()),
+        ("coh", CoherencePeakFeatures(
+            sfreq=RESAMPLE_HZ,
+            fmin=COH_FMIN,
+            fmax=COH_FMAX,
+            nperseg=COH_NPERSEG,
+            noverlap=COH_NOVERLAP
+        ))
+    ])
 
-def build_psd_riem_pipelines():
-    car = CAR()
-    psd = PSDCovariances(RESAMPLE_HZ, PSD_FMIN, PSD_FMAX)
-    ts  = TangentSpace("riemann")
-
+def build_coh_classifiers():
     return {
-        "psd_riem+lda": Pipeline([
-            ("car",car),("psd",psd),("ts",ts),("clf",LDA())
-        ]),
-        "psd_riem+lr": Pipeline([
-            ("car",car),("psd",psd),("ts",ts),
-            ("clf",LogisticRegression(max_iter=500))
-        ]),
-        "psd_riem+svm_lin": Pipeline([
-            ("car",car),("psd",psd),("ts",ts),
-            ("sc",StandardScaler()),
-            ("clf",SVC(kernel="linear"))
-        ]),
-        "psd_riem+svm_rbf": Pipeline([
-            ("car",car),("psd",psd),("ts",ts),
-            ("sc",StandardScaler()),
-            ("clf",SVC(kernel="rbf", gamma="scale"))
-        ]),
+        "cohpeak+lda": LDA(),
+        "cohpeak+lr": make_pipeline(
+            StandardScaler(),
+            LogisticRegression(max_iter=500)
+        ),
+        "cohpeak+svm_lin": make_pipeline(
+            StandardScaler(),
+            SVC(kernel="linear")
+        ),
+        "cohpeak+svm_rbf": make_pipeline(
+            StandardScaler(),
+            SVC(kernel="rbf", gamma="scale")
+        ),
     }
 
 # ============================================================
-# MAIN
+# Main
 # ============================================================
 if __name__ == "__main__":
 
@@ -206,18 +203,21 @@ if __name__ == "__main__":
             for p in ds_list.data_path(subj)
         })
 
-        for s in set(avail) & set(SESSIONS_USE):
+        for s in sorted(set(avail) & set(SESSIONS_USE)):
             print(f"\n--- Session {s} ---")
 
             ds = Stieger2021Local(INTERVAL, [s], data_dir=DATA_DIR)
             ds.subject_list = [subj]
 
             paradigm = MotorImagery(
-                n_classes=4, resample=RESAMPLE_HZ,
-                fmin=FMIN, fmax=FMAX, channels=TARGET_21
+                n_classes=4,
+                resample=RESAMPLE_HZ,
+                fmin=FMIN,
+                fmax=FMAX,
+                channels=TARGET_21
             )
 
-            # ---------- RAW ----------
+            # ---- RAW (MOABB) ----
             eval_raw = WithinSessionEvaluation(
                 paradigm=paradigm, datasets=[ds],
                 overwrite=True, hdf5_path=None
@@ -229,7 +229,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[RAW ERROR] {e}")
 
-            # ---------- PSD ----------
+            # ---- Coherence-peak (features 1x + CV rápido) ----
             try:
                 X, y, _ = paradigm.get_data(ds, subjects=[subj])
                 uniq, cnt = np.unique(y, return_counts=True)
@@ -237,32 +237,48 @@ if __name__ == "__main__":
                     raise ValueError("Classes insuficientes para CV")
 
                 cv = StratifiedKFold(
-                    n_splits=min(5, cnt.min()),
+                    n_splits=min(5, int(cnt.min())),
                     shuffle=True, random_state=42
                 )
 
+                t0 = time.perf_counter()
+                feat_pipe = build_coh_feature_extractor()
+                X_feat = feat_pipe.fit_transform(X)  # <- calcula coerência 1x aqui
+                feat_time = time.perf_counter() - t0
+                print(f"[COH] features: shape={X_feat.shape} | t={feat_time:.2f}s")
+
                 rows = []
-                for name, pipe in build_psd_riem_pipelines().items():
-                    print(f"[PSD] {name}")
-                    scores = cross_val_score(pipe, X, y, cv=cv, n_jobs=1)
+                clfs = build_coh_classifiers()
+
+                for name, clf in clfs.items():
+                    print(f"[COH] {name}")
+                    t1 = time.perf_counter()
+                    scores = cross_val_score(clf, X_feat, y, cv=cv, n_jobs=1)
+                    t_clf = time.perf_counter() - t1
+
                     rows.append({
-                        "score":float(scores.mean()),
-                        "time":np.nan,
-                        "samples":len(y),
-                        "subject":subj,
-                        "session":s,
-                        "fold":np.nan,
-                        "n_sessions":1,
-                        "dataset":"Stieger2021",
-                        "pipeline":name,
-                        "run":np.nan,
-                        "channels_used":",".join(TARGET_21)
+                        "score": float(scores.mean()),
+                        "time": float(feat_time + t_clf),   # tempo total aproximado (feat + clf)
+                        "samples": int(len(y)),
+                        "subject": int(subj),
+                        "session": int(s),
+                        "fold": np.nan,
+                        "n_sessions": 1,
+                        "dataset": "Stieger2021",
+                        "pipeline": name,
+                        "run": np.nan,
+                        "channels_used": ",".join(TARGET_21),
+                        "coh_fmin": float(COH_FMIN),
+                        "coh_fmax": float(COH_FMAX),
+                        "coh_nperseg": (np.nan if COH_NPERSEG is None else float(COH_NPERSEG)),
+                        "coh_noverlap": (np.nan if COH_NOVERLAP is None else float(COH_NOVERLAP)),
+                        "coh_n_features": int(X_feat.shape[1]),
                     })
 
                 all_results.append(pd.DataFrame(rows))
 
             except Exception as e:
-                print(f"[PSD ERROR] {e}")
+                print(f"[COH ERROR] {e}")
 
     results = pd.concat(all_results, ignore_index=True)
     results.to_csv(OUT_CSV, index=False)

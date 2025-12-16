@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cycler
 
 CHANCE         = 0.25
-RESULTS_PREFIX = "results_stieger2021"  # prefixo comum
+RESULTS_PREFIX = "coherence_peak_gridsearch_fast"  # prefixo comum
 
 # -----------------------
 # CARREGAR DADOS (com checkpoints)
@@ -118,9 +118,9 @@ def heatmap(ax, M, xticks, yticks, title, xlabel, ylabel, vmin=0.0, vmax=1.0):
     cb   = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Accuracy")
     cb.ax.tick_params(labelsize=9)
     ax.set_xticks(np.arange(len(xticks)))
-    ax.set_xticklabels(xticks, rotation=90, ha="right", fontsize=8)
+    ax.set_xticklabels(xticks, rotation=90, ha="right", fontsize=10)
     ax.set_yticks(np.arange(len(yticks)))
-    ax.set_yticklabels(yticks, fontsize=8)
+    ax.set_yticklabels(yticks, fontsize=10)
     ax.set_title(title, fontsize=12)
     ax.set_xlabel(xlabel, fontsize=8)
     ax.set_ylabel(ylabel, fontsize=8)
@@ -130,7 +130,7 @@ def heatmap(ax, M, xticks, yticks, title, xlabel, ylabel, vmin=0.0, vmax=1.0):
 # FIGURA PRINCIPAL
 # -----------------------
 np.random.seed(0)
-fig        = plt.figure(figsize=(20, 11))
+fig        = plt.figure(figsize=(20, 18))
 gs         = fig.add_gridspec(
     2, 4,
     width_ratios=[1.2, 1, 1, 1.2],
@@ -154,7 +154,7 @@ nobs  = g_pipe["count"].astype(float).to_numpy()
 sems  = np.where(nobs > 1, g_pipe["std"].to_numpy() / np.sqrt(nobs), np.nan)
 x     = np.arange(len(pipes))
 ax_bar.bar(x, means, yerr=sems, capsize=4)
-ax_bar.set_xticks(x, pipes, rotation=25, ha="right")
+ax_bar.set_xticks(x, pipes, rotation=90, ha="right", fontsize=10)
 ax_bar.set_ylabel("Accuracy (média)")
 ax_bar.set_title("Média por pipeline (± EP)")
 ax_bar.set_ylim(0.0, 1.0)
@@ -186,7 +186,7 @@ for p in pipes:
 ax_lines.set_xlabel("Sessão")
 ax_lines.set_ylabel("Accuracy (média)")
 ax_lines.set_title("Evolução por sessão (média ± IC95%)")
-ax_lines.legend(ncols=2, fontsize=8)
+ax_lines.legend(ncols=2, fontsize=7)
 ax_lines.set_ylim(0.0, 1.0)
 ax_lines.axhline(CHANCE, linestyle="--", linewidth=1, color="k", alpha=0.8)
 
@@ -196,7 +196,7 @@ data_per_pipe = [
     for p in pipes
 ]
 ax_box.boxplot(data_per_pipe, labels=pipes, showmeans=True)
-ax_box.set_xticklabels(pipes, rotation=25, ha="right")
+ax_box.set_xticklabels(pipes, rotation=90, ha="right", fontsize=8)
 ax_box.set_ylabel("Accuracy")
 ax_box.set_title("Distribuição por pipeline")
 ax_box.set_ylim(0.0, 1.0)
