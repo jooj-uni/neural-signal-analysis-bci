@@ -1,7 +1,10 @@
 import numpy as np
 import moabb
 import mne
+
 from sklearn.metrics import matthews_corrcoef
+from sklearn.base import BaseEstimator, TransformerMixin
+
 import time
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -111,6 +114,44 @@ class PseudoOnlineWindow():
         #um ponto importante a se checar é se o shape de X vai funcionar bem nos pipelines
         return np.array(X), np.array(y), np.array(times)
 
+
+class IdleBaseline(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.rest_label = 0
+
+    def fit(self, X, y=None):
+        if y is None:
+            raise ValueError("array de labels está faltando")
+        
+        idle_windows = (y == self.rest_label)
+
+        if not np.any(idle_windows):
+            raise ValueError("não há janelas de rest nos dados de treino")
+        
+        self.baseline_ = X[idle_windows].mean(axis=0)
+        return self
+
+    def transform(self, X):
+        return np.subtract(X, self.baseline_)
+
+
+class ERDS():
+
+    def __init__():
+        pass
+
+
+class PSD():
+
+    def __init__():
+        pass
+
+
+
+
+
+
+
 class PseudoOnlineEvaluation():
     """
     faz avaliacao com janelas deslizantes, tanto na mesma sessao quanto inter sessao.
@@ -123,7 +164,7 @@ class PseudoOnlineEvaluation():
     ratio: define a proporçao dos dados usada para treino
     
     """
-    def __init__(self, dataset, pipelines, method, wsize, wstep, subjects, ratio=0.7):
+    def __init__(self, dataset, pipelines, method, wsize, wstep, subjects, ratio=0.7, no_run=False):
         self.dataset = dataset
         self.pipelines = pipelines
         self.ratio = ratio
@@ -131,6 +172,7 @@ class PseudoOnlineEvaluation():
         self.wsize = wsize
         self.wstep = wstep
         self.subjects = subjects
+        self.no_run = no_run
         
         self.results_ = []
 
@@ -176,12 +218,11 @@ class PseudoOnlineEvaluation():
                     
                     #o raw mesmo fica muito aninhado dentro do dict do get_data, entao tem que acessar uma penca de dicionario ate chegar la
                     for _, runs in pre.items():
-                        for sess in runs.keys():
+                        for sess, dicts in runs.items():
                             session_keys.append(sess)
                             raws_dict[sess] = []
-                            for _, dicts in runs.items():
-                                for _, data in dicts.items():
-                                    raws_dict[sess].append(data)
+                            for _, data in dicts.items():
+                                raws_dict[sess].append(data)
                     
                     for sess in session_keys:
                         print(f"Processando sessão {sess} sujeito {subject}...")
@@ -205,13 +246,21 @@ class PseudoOnlineEvaluation():
                         X_train, y_train = X[:idx_split], y[:idx_split]
                         X_test, y_test = X[idx_split:], y[idx_split:]
 
+                        if (self.no_run):
+                            return X_train, y_train, X_test, y_test
+
                         for name, pipe in self.pipelines.items():
                             t_start = time.perf_counter()
 
+                            print("Treinando...")
                             pipe.fit(X_train, y_train)
+                            print("Modelo treinado!")
 
                             t_end = time.perf_counter()
                             t_train = t_end - t_start
+
+
+                            print(f"Tempo de treino: {t_train}")
 
                             predictions = []
                             mcc_acc = []
@@ -222,11 +271,16 @@ class PseudoOnlineEvaluation():
 
                                 t_start = time.perf_counter()
 
+                                print("Realizando previsão...")
                                 y_pred = pipe.predict([X_test[window]])[0]
-                                predictions.append(y_pred)
+                                print("Predict")
 
                                 t_end = time.perf_counter()
+
+                                predictions.append(y_pred)
                                 t_predict = t_end - t_start
+
+                                print(f"Tempo de predição: {t_predict}")
 
                                 mcc_acc = matthews_corrcoef(y_test[:window+1], predictions[:window+1]) #score mcc acumulado até a janela
 
@@ -234,6 +288,7 @@ class PseudoOnlineEvaluation():
                                     "dataset": self.dataset,
                                     "subject": subject,
                                     "session": sess,
+                                    "method": self.method,
                                     "pipeline": name,
                                     "t_train": t_train,
                                     "window": window,
@@ -258,13 +313,12 @@ class PseudoOnlineEvaluation():
                         print(f"O índice de sessões de treino é {session_split}, o dataset possui {self.dataset.n_sessions} sessões por sujeito")
 
                         for _, runs in pre.items():
-                            for sess in runs.keys():
+                            for sess, dicts in runs.items():
                                 session_keys.append(sess)
                                 raws_test[sess] = []
                                 raws_dict[sess] = []
-                                for _, dicts in runs.items():
-                                    for _, data in dicts.items():   #salva separado os dados de treino e de teste
-                                        raws_dict[sess].append(data)
+                                for _, data in dicts.items():   #salva separado os dados de treino e de teste
+                                    raws_dict[sess].append(data)
                         
                         #essa verificação é porque eu acahva que o int() arredondava pra cima o valor... de todo jeito, nao faz mal deixar isso aqui
                         if session_split == self.dataset.n_sessions:
@@ -299,15 +353,21 @@ class PseudoOnlineEvaluation():
                                                             )
 
                         X_train, y_train, times_train = wgen_train.generate_windows()
+
+                        if(self.no_run):
+                            return X_train, y_train
                             
                         print(f"Treinando nas sessões {train_sessions}...")
 
                         for name, pipe in self.pipelines.items():
+                            print(f"Pipeline: {name}")
+                            print("Treinando modelo")
                             t_start = time.perf_counter()
 
                             pipe.fit(X_train, y_train)
 
                             t_end = time.perf_counter()
+                            print("Modelo treinado")
                             t_train = t_end - t_start
 
                             predictions = []
@@ -338,6 +398,7 @@ class PseudoOnlineEvaluation():
 
 
                                 for window in range(len(X_test)):
+                                    print(f"testando na janela {window}")
                                     #tempos de inicio e fim da janela, pode ser util pra plot
                                     window_start = times_test[window][0]
                                     window_end = times_test[window][1]
@@ -349,17 +410,27 @@ class PseudoOnlineEvaluation():
 
                                     t_predict = t_end - t_start
 
+                                    print(f"tempor de predict: {t_predict}")
+
                                     predictions_sess.append(y_pred)
                                     predictions.append(y_pred)
                                     y_all.append(y_test[window])
 
+                                    print("calculando score")
+                                    t_start1 = time.perf_counter()
                                     mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
                                     mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
+                                    t_end1 = time.perf_counter()
+
+                                    t_predict1 = t_end1 - t_start1
+                                    print(f"tempo de calculo de score: {t_predict1}")
+
 
                                     res = {
                                     "dataset": self.dataset,
                                     "subject": subject,
                                     "session": sess,
+                                    "method": self.method,
                                     "pipeline": name,
                                     "t_train": t_train,
                                     "window": window,
