@@ -13,15 +13,31 @@ import pandas as pd
 
 class PseudoOnlineWindow():
     """
-    cria janelas deslizantes e as rotula, baseado no arigo do framework pseudo online
-    os rotulos sao dados de acordo com a classe majoritaria da janela
+    Segments data in windows for pseudo-online analysis.
 
-    raw: objeto mne.Raw
-    events: array de eventos padrao do mne
-    interval: parametro do dataset que define os intervalos de imagetica
-    task_ids: define quais os ids das tasks que vao ser classificadas (permite problema multiclasse ou one-versus-rest, por exemplo)
-    window_size: define tamanho (em segundos) da janela
-    window_step: distancia entre os inicios de duas janelas adjacentes, entao define a sobreposicao entre janelas
+
+    Parameters:
+        raw: mne.Raw object
+            The continuous data.
+        events: arra
+            MNE event array.
+        interval: list
+            Dataset parameter defining imagery interval.
+        task_ids: dict
+            Defines the tasks and its numeric IDs. It can be used to select a subset of the dataset tasks.
+        window_size: float
+            The window size in seconds.
+        window_step: int
+            Distance in seconds between the start of two consecutive windows. It can be used to set superposition between windows, when value is lower than window_size.
+
+    Returns
+        X: nd array shape=(n_windows, n_channels, n_times)
+            The windows (data).
+        y: nd array
+            Window labels in the same order as X.
+        times: nd array
+            Array of tuples. Each tuple is the timestamps (start and end) of each window. Might be useful for plotting.
+    
     """
     def __init__(self, raw, events, interval, task_ids, window_size, window_step, chan_list=None):
         self.raw = raw
@@ -116,7 +132,7 @@ class PseudoOnlineWindow():
 
 
 class IdleBaseline(BaseEstimator, TransformerMixin):
-    def __init__(self):
+    def __init__(self, rest_label=0):
         self.rest_label = 0
 
     def fit(self, X, y=None):
@@ -135,21 +151,28 @@ class IdleBaseline(BaseEstimator, TransformerMixin):
         return np.subtract(X, self.baseline_)
 
 
-class ERDS():
+class PSD(BaseEstimator, TransformerMixin):
 
-    def __init__():
-        pass
+    def __init__(self, sfreq, fmin=0, fmax=None):
+        self.sfreq = sfreq
+        self.fmin = fmin
+        self.fmax = fmax
 
+    def fit (self, X, y=None):
+        return self
 
-class PSD():
+    def transform(self, X):
+        
+        fmax = self.fmax if self.fmax is not None else self.sfreq / 2
 
-    def __init__():
-        pass
-
-
-
-
-
+        psds, _ = mne.time_frequency.psd_array_welch(X, 
+                                                     sfreq=self.sfreq,
+                                                     fmin=self.fmin,
+                                                     fmax=self.fmax,
+                                                     average='mean')
+        
+        return psds
+        
 
 
 class PseudoOnlineEvaluation():
