@@ -29,14 +29,6 @@ class PseudoOnlineWindow():
             The window size in seconds.
         window_step: int
             Distance in seconds between the start of two consecutive windows. It can be used to set superposition between windows, when value is lower than window_size.
-
-    Returns
-        X: nd array shape=(n_windows, n_channels, n_times)
-            The windows (data).
-        y: nd array
-            Window labels in the same order as X.
-        times: nd array
-            Array of tuples. Each tuple is the timestamps (start and end) of each window. Might be useful for plotting.
     
     """
     def __init__(self, raw, events, interval, task_ids, window_size, window_step, chan_list=None):
@@ -57,25 +49,27 @@ class PseudoOnlineWindow():
 
     def generate_labels(self):
         """
-        atribui uma classe para cada amostra do dado. inicializa o vetor de rotulos em 0 e atribui a classe da task
-        às amostras do período de imagética
+        Attributes aa label for each sample. The label vector is initialized with 0 and each data point is attributed to the task label, if it is in imagery period.
+
+        Returns:
+            labels: nd array
+                Label vector containing labels for each data sample.
         """
         
-        #aqui n_sample eh de uma forma e la embaixo de outra
         n_samples = self.raw.n_times
         labels = np.zeros(n_samples, dtype=int)
 
-        valid_ids = list(self.task_ids.values()) #vai selecionar so os eventos que queremos
+        valid_ids = list(self.task_ids.values())
 
         for ev in self.events:
             ev_idx, _, ev_id = ev
 
             if ev_id in valid_ids:
-                # considera so o periodo de imagetica para rotular como task
+                # uses only imagery period for task attribution
                 start = ev_idx + self.t_start
                 stop = ev_idx + self.t_end
 
-                # garante limites do array
+                # ensure array limits
                 start = max(0, start)
                 stop = min(n_samples, stop)
 
@@ -85,13 +79,19 @@ class PseudoOnlineWindow():
 
     def generate_windows(self):
         """
-        gera janelas para todo o dado, alem de conter a logica de desempate de classe
-        return: array de dados das janelas X (shape=(2,)), array de labels y de cada janela, array de tempos em s de inicio de cada janela
+        Generates and labels windows.
+        
+        Returns:
+            X: nd array shape=(n_windows, n_channels, n_times)
+                The windows (data).
+            y: nd array
+                Window labels in the same order as X.
+            times: nd array
+                Array of tuples. Each tuple is the timestamps (start and end) of each window. Might be useful for plotting.
         """
         X, y, times = [], [], []
 
-        data = self.raw.get_data()  #(n_channels, n_samples)
-        #n_samples ta sendo obtido de outra forma la em cima
+        data = self.raw.get_data()
         n_samples = data.shape[1]
 
         for start_idx in range (0, n_samples - self.window_size, self.window_step):
@@ -100,13 +100,13 @@ class PseudoOnlineWindow():
             if self.chan_list == None:
                 window_data = data[:, start_idx : end_idx]
                 window_labels = self.labels[start_idx:end_idx]
-            else:       #seleçao de canais
+            else:   #channel selection
                 window_data = []
                 for chan in self.chan_list:
                     if chan in self.raw.ch_names:
                         window_data.append(data[chan, start_idx : end_idx])
                     else:
-                        raise ValueError(f"Canal {chan} não está na lista {self.raw.ch_names}")
+                        raise ValueError(f"Channel {chan} is not in {self.raw.ch_names}")
                 window_labels = self.labels[start_idx:end_idx]
 
             count = np.bincount(window_labels)
@@ -114,35 +114,46 @@ class PseudoOnlineWindow():
 
             prop_major = count[major] / len(window_labels)
 
-            #define a proporcao de empate
+            # class draw proportion
             n_classes = len(np.unique(window_labels))
             draw_prop = 1 / n_classes
 
+            # in case of draw, the posterior label wins
             if prop_major != draw_prop:
                 y.append(major)
-            #se ha empate, vence a classe posterior; acho que agora ta tratando de quaisquer qtd de classes na janela
             else:
                 y.append(window_labels[-1])
 
             X.append(window_data)
             times.append(((start_idx / self.sfreq), (end_idx / self.sfreq)))
 
-        #um ponto importante a se checar é se o shape de X vai funcionar bem nos pipelines
         return np.array(X), np.array(y), np.array(times)
 
 
 class IdleBaseline(BaseEstimator, TransformerMixin):
+    """
+    Applies baseline correction. It uses a fixed baseline. This transformer has to be applied to windowed data.
+
+    Parameters:
+        rest_label: int
+            Label representing idle state.
+    
+    Returns:
+        X: nd array shape=(n_windows, n_channels, n_times)
+            Baseline corrected windowed data.
+    """
+
     def __init__(self, rest_label=0):
         self.rest_label = 0
 
     def fit(self, X, y=None):
         if y is None:
-            raise ValueError("array de labels está faltando")
+            raise ValueError("Missing labels array")
         
         idle_windows = (y == self.rest_label)
 
         if not np.any(idle_windows):
-            raise ValueError("não há janelas de rest nos dados de treino")
+            raise ValueError("There are no rest windows")
         
         self.baseline_ = X[idle_windows].mean(axis=0)
         return self
@@ -173,19 +184,37 @@ class PSD(BaseEstimator, TransformerMixin):
         
         return psds
         
+class IdleDetection():
+    """
+    Classifier for idle state detection.
+    """
+    def __init__():
+        pass
+
+    def fit(self, X, y=None):
+        pass
+
+    def predict(self, X, y):
+        pass
 
 
 class PseudoOnlineEvaluation():
     """
-    faz avaliacao com janelas deslizantes, tanto na mesma sessao quanto inter sessao.
+    Evaluates windowed data in pseudo-online manner (simulating real time asynchronous BCI). It can be done within-session, evaluating only one session data, or inter-session, evaluating performance across sessions, without
+    breaking signal causality.
 
-    dataset: dataset utilizado
-    pipelines: dict de pipelines
-    method: pode ser 'within-session' para avaliacao na mesma sessao ou 'inter-session' para avaliacao entre sessoes
-        within session: treina nas primeiras k trials definidas por ratio e testa nas demais, dentro de uma unica sessao
-        inter session: treina nas prmeiras k sessoes definidas por ratio e testa nas demais sessoes
-    ratio: define a proporçao dos dados usada para treino
-    
+    Parameters:
+        dataset: MOABB dataset
+            Dataset to be used. It has to be a MOABB dataset object.
+        pipelines: dict
+            Sklearn pipelines dictionary, as used in MOABB.
+        method: string
+            Either 'within-session' or 'inter-session'.
+                within-session: trains models on first k windows, testing on the remaining ones.
+                inter-session: trains models on first k sessions, testing on the remaining ones; doesn't violate data causality.
+        ratio: float
+            Proportion of data to be used in training.
+        
     """
     def __init__(self, dataset, pipelines, method, wsize, wstep, subjects, ratio=0.7, no_run=False):
         self.dataset = dataset
@@ -201,10 +230,10 @@ class PseudoOnlineEvaluation():
 
     def raw_concat(self, raw_list):
         """
-        essa função garante que nao vai ter erro na concatenação dos raws, pro caso de a lista estar vazia, ter um só elemento, ou for uma lista com vários raws (como se é esperado)
+        Auxiliary function for raw data concat.
         """
         if len(raw_list) == 0:
-            raise ValueError("A lista de raws está vazia")
+            raise ValueError("Raw list is empty.")
         elif len(raw_list) == 1:    #aqui, o raw de uma sessao pode ser constituido de 1 ou mais runs, por isso essa verificação
             if type(raw_list[0]) != list:
                 return raw_list[0]
@@ -215,31 +244,24 @@ class PseudoOnlineEvaluation():
 
     def evaluate(self):
         """
-        ******ainda precisa ser validado*******
-        ******adicionar verificacoes de erro e de tipos**********
-        ******adicionar interpretabilidade e rastreabilidade*******      
+        Main function for processing data.
         """
 
         for subject in self.subjects:
             if subject not in self.dataset.subject_list:
-                raise ValueError(f"Índice de sujeito inválido: {subject}")
+                raise ValueError(f"Invalid subject index: {subject}")
             else:
-                print(f"Processando sujeito {subject}...")
+                print(f"Processing subject {subject}...")
 
                 raws_dict = {}
                 raws_test = {}
                 pre = self.dataset.get_data(subjects=[subject])
-
-                """
-                o within session faz split nas janelas, mas talvez o melhor seja fazer split como no inter-session (separar os raws de treino e teste antes de gerar janela)
-                de todo modo, isso é tranquilo de mudar
-                """
                 
-                session_keys = []   #armazenar os ids de sessoes (que nem sempre sao ints)
+                session_keys = []   # stores session ids (not always int)
 
                 if self.method == 'within-session':
                     
-                    #o raw mesmo fica muito aninhado dentro do dict do get_data, entao tem que acessar uma penca de dicionario ate chegar la
+                    # raw extraction from moabb dataset
                     for _, runs in pre.items():
                         for sess, dicts in runs.items():
                             session_keys.append(sess)
@@ -248,9 +270,9 @@ class PseudoOnlineEvaluation():
                                 raws_dict[sess].append(data)
                     
                     for sess in session_keys:
-                        print(f"Processando sessão {sess} sujeito {subject}...")
-                        raw = self.raw_concat(raws_dict[sess]) #concatena todos os raws e gera o split depois
-                        events, event_ids = mne.events_from_annotations(raw)  #aqui da pra extrair o array de eventos pra usar no gerador de janelas
+                        print(f"Processing session {sess} subject {subject}...")
+                        raw = self.raw_concat(raws_dict[sess])
+                        events, event_ids = mne.events_from_annotations(raw)
 
                         wgen = PseudoOnlineWindow(raw=raw,
                                                 events=events,
@@ -260,7 +282,7 @@ class PseudoOnlineEvaluation():
                                                 window_step=self.wstep
                                                 )
                         
-                        X, y, times = wgen.generate_windows()   #o times pode ser usado depois pra plot, etc
+                        X, y, times = wgen.generate_windows()
 
                         idx_split = int(len(X) * self.ratio)
 
@@ -275,15 +297,15 @@ class PseudoOnlineEvaluation():
                         for name, pipe in self.pipelines.items():
                             t_start = time.perf_counter()
 
-                            print("Treinando...")
+                            print("Fitting...")
                             pipe.fit(X_train, y_train)
-                            print("Modelo treinado!")
+                            print("Done fitting!")
 
                             t_end = time.perf_counter()
                             t_train = t_end - t_start
 
 
-                            print(f"Tempo de treino: {t_train}")
+                            print(f"Fitting time: {t_train}")
 
                             predictions = []
                             mcc_acc = []
@@ -294,18 +316,14 @@ class PseudoOnlineEvaluation():
 
                                 t_start = time.perf_counter()
 
-                                print("Realizando previsão...")
                                 y_pred = pipe.predict([X_test[window]])[0]
-                                print("Predict")
 
                                 t_end = time.perf_counter()
 
                                 predictions.append(y_pred)
                                 t_predict = t_end - t_start
 
-                                print(f"Tempo de predição: {t_predict}")
-
-                                mcc_acc = matthews_corrcoef(y_test[:window+1], predictions[:window+1]) #score mcc acumulado até a janela
+                                mcc_acc = matthews_corrcoef(y_test[:window+1], predictions[:window+1]) # accumulated mcc score until this window
 
                                 res = {
                                     "dataset": self.dataset,
@@ -328,19 +346,18 @@ class PseudoOnlineEvaluation():
 
                 elif self.method == 'inter-session':
                     if self.dataset.n_sessions > 1:
-                        #split de sessoes
                         session_split = int(self.ratio * self.dataset.n_sessions)
                         raws_list = []
                         raws_train = []
 
-                        print(f"O índice de sessões de treino é {session_split}, o dataset possui {self.dataset.n_sessions} sessões por sujeito")
+                        print(f"Splitting index is {session_split}, dataset has {self.dataset.n_sessions} sessions per subject.")
 
                         for _, runs in pre.items():
                             for sess, dicts in runs.items():
                                 session_keys.append(sess)
                                 raws_test[sess] = []
                                 raws_dict[sess] = []
-                                for _, data in dicts.items():   #salva separado os dados de treino e de teste
+                                for _, data in dicts.items():
                                     raws_dict[sess].append(data)
                         
                         #essa verificação é porque eu acahva que o int() arredondava pra cima o valor... de todo jeito, nao faz mal deixar isso aqui
@@ -363,7 +380,6 @@ class PseudoOnlineEvaluation():
                         
                         
                         raws_train = self.raw_concat(raws_list)
-                        print("sessoes de treino concatenadas")
 
                         events, event_ids = mne.events_from_annotations(raws_train)
 
@@ -380,17 +396,17 @@ class PseudoOnlineEvaluation():
                         if(self.no_run):
                             return X_train, y_train
                             
-                        print(f"Treinando nas sessões {train_sessions}...")
+                        print(f"Fitting in sessions: {train_sessions}...")
 
                         for name, pipe in self.pipelines.items():
                             print(f"Pipeline: {name}")
-                            print("Treinando modelo")
+                            print("FItting...")
                             t_start = time.perf_counter()
 
                             pipe.fit(X_train, y_train)
 
                             t_end = time.perf_counter()
-                            print("Modelo treinado")
+                            print("Done fitting!")
                             t_train = t_end - t_start
 
                             predictions = []
@@ -398,7 +414,7 @@ class PseudoOnlineEvaluation():
                             mcc_acc = []
                             
                             for sess in test_sessions:
-                                print(f"Testando na sessão {sess}...")
+                                print(f"Testing in session {sess}...")
 
                                 raws = self.raw_concat(raws_test[sess])
 
@@ -421,7 +437,7 @@ class PseudoOnlineEvaluation():
 
 
                                 for window in range(len(X_test)):
-                                    print(f"testando na janela {window}")
+                                    print(f"Testing on window {window}")
                                     #tempos de inicio e fim da janela, pode ser util pra plot
                                     window_start = times_test[window][0]
                                     window_end = times_test[window][1]
@@ -433,21 +449,12 @@ class PseudoOnlineEvaluation():
 
                                     t_predict = t_end - t_start
 
-                                    print(f"tempor de predict: {t_predict}")
-
                                     predictions_sess.append(y_pred)
                                     predictions.append(y_pred)
                                     y_all.append(y_test[window])
 
-                                    print("calculando score")
-                                    t_start1 = time.perf_counter()
                                     mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
                                     mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
-                                    t_end1 = time.perf_counter()
-
-                                    t_predict1 = t_end1 - t_start1
-                                    print(f"tempo de calculo de score: {t_predict1}")
-
 
                                     res = {
                                     "dataset": self.dataset,
@@ -469,7 +476,7 @@ class PseudoOnlineEvaluation():
 
                                     self.results_.append(res)
                     else:
-                        raise ValueError("Não há sessões suficientes para inter-session")
+                        raise ValueError("There are not enough sessions for evaluation.")
         if len(self.results_):
             self.results_ = pd.DataFrame(self.results_)
-            self.results_.to_csv("pseudo-online-results.csv", index=False)
+            self.results_.to_csv(f"results-S{subject}.csv", index=False)
