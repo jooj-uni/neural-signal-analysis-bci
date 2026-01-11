@@ -1,9 +1,19 @@
+# classification.py
 import os, re, inspect, warnings, time
 import numpy as np
 import pandas as pd
 import moabb
 
-from typing import List
+# ============================================================
+# 0) Cache dirs (evita erro do MNE/MOABB) - antes de MNE/MOABB internos
+# ============================================================
+MNE_DATA_DIR  = r"D:\dados_stieger"
+os.makedirs(MNE_DATA_DIR, exist_ok=True)
+os.environ["MNE_DATA"] = MNE_DATA_DIR
+
+# ============================================================
+# Imports dependentes
+# ============================================================
 from moabb.paradigms import MotorImagery
 from moabb.evaluations import WithinSessionEvaluation
 from moabb.datasets import Stieger2021
@@ -24,18 +34,24 @@ from scipy import signal
 warnings.filterwarnings("ignore")
 moabb.set_log_level("info")
 
-# ---- Config ----
+# ============================================================
+# Config
+# ============================================================
 DATA_DIR          = r"D:\dados_stieger"
-SUBJECTS          = list(range(1, 5))
-SESSIONS_USE      = [1, 2, 3, 4, 5, 6, 7]
+SUBJECTS          = list(range(1, 64))
+SESSIONS_USE      = [1,2,3,4,5,6,7]
 INTERVAL          = [0.5, 2.5]
 RESAMPLE_HZ       = 128
 FMIN, FMAX        = 0.5, 45.0
 OUT_CSV           = "results_stieger2021_full.csv"
 
+# Coerência: pico na banda
 COH_FMIN, COH_FMAX = 8.0, 30.0
-COH_NPERSEG        = None
-COH_NOVERLAP       = None
+
+# >>> solução simples/robusta: fixe Welch <<<
+# 2s de época em 128 Hz -> 256 amostras. Use nperseg=128 (1s), overlap=64.
+COH_NPERSEG  = 128
+COH_NOVERLAP = 32
 
 TARGET_21 = [
     "FC3","FC1","FCz","FC2","FC4",
@@ -43,21 +59,13 @@ TARGET_21 = [
     "CP3","CP1","CPz","CP2","CP4"
 ]
 
-BASE_PIPELINE_NAMES = [
-    "csp+lda","csp+lr",
-    "riem+lda","riem+lr",
-    "riem+svm_lin","riem+svm_rbf"
-]
-
-COH_PIPELINE_NAMES = [
-    "cohpeak+lda","cohpeak+lr",
-    "cohpeak+svm_lin","cohpeak+svm_rbf"
-]
-
 # ============================================================
 # Dataset local
 # ============================================================
 class Stieger2021Local(Stieger2021):
+    """
+    Lê .mat locais no formato: S{subject}_Session_{session}.mat
+    """
     def __init__(self, interval=[0, 3], sessions=None, fix_bads=True, data_dir=None):
         sig = inspect.signature(super().__init__)
         if "fix_bads" in sig.parameters:
@@ -84,36 +92,51 @@ class Stieger2021Local(Stieger2021):
 # Transformers
 # ============================================================
 class CAR(BaseEstimator, TransformerMixin):
-    def fit(self, X, y=None): return self
+    def fit(self, X, y=None): 
+        return self
     def transform(self, X):
         X = np.asarray(X)
+        # X: (n_trials, n_ch, n_times)
         return X - X.mean(axis=1, keepdims=True)
 
 class CoherencePeakFeatures(BaseEstimator, TransformerMixin):
     """
-    Para cada trial:
-      - coerência entre todos os pares
-      - pico (máximo) na banda vira feature do par
+    Solução simples:
+      - calcula coerência (Welch) para pares não-redundantes (i<j)
+      - feature = max(coerência) na banda [fmin, fmax]
     Retorna: (n_trials, n_pairs)
+
+    Observação: não calcula pares redundantes (não usa i==j e não repete j<i).
     """
-    def __init__(self, sfreq, fmin=8.0, fmax=30.0, nperseg=None, noverlap=None):
+    def __init__(self, sfreq, fmin=8.0, fmax=30.0, nperseg=128, noverlap=64):
         self.sfreq = float(sfreq)
         self.fmin = float(fmin)
         self.fmax = float(fmax)
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-
-    def fit(self, X, y=None):
-        return self
+        self.nperseg = int(nperseg)
+        self.noverlap = int(noverlap)
 
     @staticmethod
     def _pairs(n_ch):
         return [(i, j) for i in range(n_ch - 1) for j in range(i + 1, n_ch)]
 
+    def fit(self, X, y=None):
+        # cache dos pares
+        X = np.asarray(X)
+        self._n_ch_ = X.shape[1]
+        self._pairs_ = self._pairs(self._n_ch_)
+        return self
+
     def transform(self, X):
         X = np.asarray(X)
-        n_trials, n_ch, _ = X.shape
-        pairs = self._pairs(n_ch)
+        n_trials, n_ch, n_times = X.shape
+        if n_ch != getattr(self, "_n_ch_", n_ch):
+            self._pairs_ = self._pairs(n_ch)
+
+        # nperseg não pode ser maior que n_times
+        nperseg = min(self.nperseg, n_times)
+        noverlap = min(self.noverlap, max(0, nperseg - 1))
+
+        pairs = self._pairs_
         feats = np.zeros((n_trials, len(pairs)), dtype=np.float32)
 
         for t in range(n_trials):
@@ -122,18 +145,21 @@ class CoherencePeakFeatures(BaseEstimator, TransformerMixin):
                 f, Cxy = signal.coherence(
                     Xt[i], Xt[j],
                     fs=self.sfreq,
-                    nperseg=self.nperseg,
-                    noverlap=self.noverlap,
+                    nperseg=nperseg,
+                    noverlap=noverlap,
                     detrend="constant",
                 )
                 band = (f >= self.fmin) & (f <= self.fmax)
-                feats[t, k] = float(np.nanmax(Cxy[band])) if np.any(band) else 0.0
+                if np.any(band):
+                    v = np.nanmax(Cxy[band])
+                    feats[t, k] = float(v) if np.isfinite(v) else 0.0
+                else:
+                    feats[t, k] = 0.0
 
-        feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-        return feats
+        return np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
 
 # ============================================================
-# Pipelines
+# Pipelines RAW (MOABB)
 # ============================================================
 def build_base_pipelines():
     car = CAR()
@@ -157,34 +183,53 @@ def build_base_pipelines():
                                   ("clf",SVC(kernel="rbf", gamma="scale"))]),
     }
 
-def build_coh_feature_extractor():
-    return Pipeline([
-        ("car", CAR()),
-        ("coh", CoherencePeakFeatures(
-            sfreq=RESAMPLE_HZ,
-            fmin=COH_FMIN,
-            fmax=COH_FMAX,
-            nperseg=COH_NPERSEG,
-            noverlap=COH_NOVERLAP
-        ))
-    ])
-
+# ============================================================
+# Classificadores para coerência (simples e robustos)
+# ============================================================
 def build_coh_classifiers():
+    # LDA comum pode ser instável; shrinkage é a alternativa simples que funciona.
     return {
-        "cohpeak+lda": LDA(),
-        "cohpeak+lr": make_pipeline(
-            StandardScaler(),
-            LogisticRegression(max_iter=500)
-        ),
-        "cohpeak+svm_lin": make_pipeline(
-            StandardScaler(),
-            SVC(kernel="linear")
-        ),
-        "cohpeak+svm_rbf": make_pipeline(
-            StandardScaler(),
-            SVC(kernel="rbf", gamma="scale")
-        ),
+        "cohpeak+lda_shrink": Pipeline([
+            ("sc", StandardScaler()),
+            ("clf", LDA(solver="lsqr", shrinkage="auto")),
+        ]),
+        "cohpeak+lr": Pipeline([
+            ("sc", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=500)),
+        ]),
+        "cohpeak+svm_lin": Pipeline([
+            ("sc", StandardScaler()),
+            ("clf", SVC(kernel="linear")),
+        ]),
+        "cohpeak+svm_rbf": Pipeline([
+            ("sc", StandardScaler()),
+            ("clf", SVC(kernel="rbf", gamma="scale")),
+        ]),
     }
+
+# ============================================================
+# Helpers
+# ============================================================
+def _available_sessions(ds_list, subj):
+    paths = ds_list.data_path(subj)
+    out = set()
+    for p in paths:
+        base = os.path.basename(p)
+        try:
+            ses = int(base.split("_")[-1].split(".")[0])
+            out.add(ses)
+        except Exception:
+            pass
+    return sorted(out)
+
+def _make_cv(y):
+    uniq, cnt = np.unique(y, return_counts=True)
+    if cnt.min() < 2:
+        return None
+    n_splits = min(5, int(cnt.min()))
+    if n_splits < 2:
+        return None
+    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
 # ============================================================
 # Main
@@ -198,10 +243,7 @@ if __name__ == "__main__":
 
         ds_list = Stieger2021Local(INTERVAL, SESSIONS_USE, data_dir=DATA_DIR)
         ds_list.subject_list = [subj]
-        avail = sorted({
-            int(os.path.basename(p).split("_")[-1].split(".")[0])
-            for p in ds_list.data_path(subj)
-        })
+        avail = _available_sessions(ds_list, subj)
 
         for s in sorted(set(avail) & set(SESSIONS_USE)):
             print(f"\n--- Session {s} ---")
@@ -217,68 +259,87 @@ if __name__ == "__main__":
                 channels=TARGET_21
             )
 
-            # ---- RAW (MOABB) ----
-            eval_raw = WithinSessionEvaluation(
-                paradigm=paradigm, datasets=[ds],
-                overwrite=True, hdf5_path=None
-            )
+            # -------------------------
+            # 1) RAW (MOABB Evaluation)
+            # -------------------------
             try:
+                eval_raw = WithinSessionEvaluation(
+                    paradigm=paradigm,
+                    datasets=[ds],
+                    overwrite=True,
+                    hdf5_path=None
+                )
                 res = eval_raw.process(build_base_pipelines())
                 res["channels_used"] = ",".join(TARGET_21)
                 all_results.append(res)
             except Exception as e:
-                print(f"[RAW ERROR] {e}")
+                print(f"[RAW ERROR] {repr(e)}")
 
-            # ---- Coherence-peak (features 1x + CV rápido) ----
+            # -----------------------------------------
+            # 2) Coerência -> vetor de features -> classif.
+            # -----------------------------------------
             try:
                 X, y, _ = paradigm.get_data(ds, subjects=[subj])
-                uniq, cnt = np.unique(y, return_counts=True)
-                if cnt.min() < 2:
-                    raise ValueError("Classes insuficientes para CV")
+                cv = _make_cv(y)
+                if cv is None:
+                    raise ValueError("Classes insuficientes para CV.")
 
-                cv = StratifiedKFold(
-                    n_splits=min(5, int(cnt.min())),
-                    shuffle=True, random_state=42
-                )
-
+                # feature extraction 1x
                 t0 = time.perf_counter()
-                feat_pipe = build_coh_feature_extractor()
-                X_feat = feat_pipe.fit_transform(X)  # <- calcula coerência 1x aqui
+                feat_extractor = Pipeline([
+                    ("car", CAR()),
+                    ("coh", CoherencePeakFeatures(
+                        sfreq=RESAMPLE_HZ,
+                        fmin=COH_FMIN,
+                        fmax=COH_FMAX,
+                        nperseg=COH_NPERSEG,
+                        noverlap=COH_NOVERLAP
+                    ))
+                ])
+                X_feat = feat_extractor.fit_transform(X)
                 feat_time = time.perf_counter() - t0
-                print(f"[COH] features: shape={X_feat.shape} | t={feat_time:.2f}s")
+
+                # remove features constantes (global, fora do CV) — solução simples
+                var = X_feat.var(axis=0)
+                keep = var > 0
+                if keep.sum() == 0:
+                    raise ValueError("Coherence features degeneradas: variância zero em todas as features.")
+                X_feat = X_feat[:, keep]
+
+                print(f"[COH] X_feat: {X_feat.shape} | feat_time={feat_time:.2f}s | kept={keep.sum()}/{len(keep)}")
 
                 rows = []
-                clfs = build_coh_classifiers()
-
-                for name, clf in clfs.items():
-                    print(f"[COH] {name}")
+                for name, clf in build_coh_classifiers().items():
                     t1 = time.perf_counter()
-                    scores = cross_val_score(clf, X_feat, y, cv=cv, n_jobs=1)
+                    scores = cross_val_score(clf, X_feat, y, cv=cv, n_jobs=1, error_score=np.nan)
                     t_clf = time.perf_counter() - t1
 
                     rows.append({
-                        "score": float(scores.mean()),
-                        "time": float(feat_time + t_clf),   # tempo total aproximado (feat + clf)
+                        "score": float(np.nanmean(scores)),
+                        "score_std": float(np.nanstd(scores)),
+                        "time": float(feat_time + t_clf),
                         "samples": int(len(y)),
                         "subject": int(subj),
                         "session": int(s),
-                        "fold": np.nan,
-                        "n_sessions": 1,
                         "dataset": "Stieger2021",
                         "pipeline": name,
-                        "run": np.nan,
                         "channels_used": ",".join(TARGET_21),
+
                         "coh_fmin": float(COH_FMIN),
                         "coh_fmax": float(COH_FMAX),
-                        "coh_nperseg": (np.nan if COH_NPERSEG is None else float(COH_NPERSEG)),
-                        "coh_noverlap": (np.nan if COH_NOVERLAP is None else float(COH_NOVERLAP)),
+                        "coh_nperseg": int(COH_NPERSEG),
+                        "coh_noverlap": int(COH_NOVERLAP),
                         "coh_n_features": int(X_feat.shape[1]),
+                        "cv_n_splits": int(cv.get_n_splits()),
                     })
 
                 all_results.append(pd.DataFrame(rows))
 
             except Exception as e:
-                print(f"[COH ERROR] {e}")
+                print(f"[COH ERROR] {repr(e)}")
+
+    if len(all_results) == 0:
+        raise RuntimeError("Nenhum resultado foi gerado (all_results vazio).")
 
     results = pd.concat(all_results, ignore_index=True)
     results.to_csv(OUT_CSV, index=False)

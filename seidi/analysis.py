@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cycler
 
 CHANCE         = 0.25
-RESULTS_PREFIX = "coherence_peak_gridsearch_fast"  # prefixo comum
+RESULTS_PREFIX = "results_stieger2021_full"  # prefixo comum
 
 # -----------------------
 # CARREGAR DADOS (com checkpoints)
