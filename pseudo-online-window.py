@@ -4,12 +4,14 @@ import mne
 
 from sklearn.metrics import matthews_corrcoef
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.linear_model import LogisticRegression
 
 import time
 import matplotlib.pyplot as plt
 import pandas as pd
 
-
+REST_LABEL = 0
+REJECT_LABEL = -1
 
 class PseudoOnlineWindow():
     """
@@ -188,14 +190,19 @@ class IdleDetection():
     """
     Classifier for idle state detection.
     """
-    def __init__():
-        pass
+    def __init__(self, model, threshold=0.6):
+        self.threshold = threshold
+        self.model = model
 
-    def fit(self, X, y=None):
-        pass
+    def fit(self, X, y):
+        y_idle = (y != REST_LABEL).astype(int)
+        self.model.fit(X, y_idle)
+        return self
 
-    def predict(self, X, y):
-        pass
+    def is_idle(self, window):
+        p_idle = self.model.predict_proba(window)[0, 0]
+
+        return 0 if (p_idle < self.threshold) else 1, p_idle
 
 
 class PseudoOnlineEvaluation():
@@ -212,21 +219,32 @@ class PseudoOnlineEvaluation():
             Either 'within-session' or 'inter-session'.
                 within-session: trains models on first k windows, testing on the remaining ones.
                 inter-session: trains models on first k sessions, testing on the remaining ones; doesn't violate data causality.
+        wsize: float
+            Window size.
+        wstep: int
+            Distance between consecutive windows (start to start).
+        subjects: list
+            List of subjects to process.
         ratio: float
             Proportion of data to be used in training.
+        threshold: float
+            Confidence threshold for classification.
         
     """
-    def __init__(self, dataset, pipelines, method, wsize, wstep, subjects, ratio=0.7, no_run=False):
+    def __init__(self, dataset, class_pipelines, method, wsize, wstep, subjects, feature_pipeline=None, ratio=0.7, threshold=0.6, no_run=False):
         self.dataset = dataset
-        self.pipelines = pipelines
+        self.feature_pipeline = feature_pipeline
+        self.class_pipelines = class_pipelines
         self.ratio = ratio
         self.method = method
         self.wsize = wsize
         self.wstep = wstep
         self.subjects = subjects
+        self.task_threshold = threshold
         self.no_run = no_run
         
         self.results_ = []
+        self.model_results_ = []
 
     def raw_concat(self, raw_list):
         """
@@ -241,11 +259,108 @@ class PseudoOnlineEvaluation():
                 return mne.concatenate_raws(raw_list[0])
         else:
             return mne.concatenate_raws(raw_list)
+        
+    def window_process(self, subject, sess, X_test, y_test, times_test):
+        # window processing loop
+        for window in range(len(X_test)):
+            window_start = times_test[window][0]
+            window_end = times_test[window][1]
+
+            t_start = time.perf_counter()
+
+            if (self.feature_pipeline != None):
+                feature_window = self.feature_pipeline.transform([X_test[window]])
+            else:
+                feature_window = [X_test[window]]
+
+            t_end = time.perf_counter()
+
+            t_transform = t_end - t_start
+
+            t_start = time.perf_counter()
+            
+            idle_window, idle_proba = self.idle_detector.is_idle(feature_window)
+
+            t_end = time.perf_counter()
+            t_idle_detect = t_end - t_start
+
+            task_proba = None
+
+            if not idle_window:
+                for name, pipe in self.class_pipelines:
+                    t_start = time.perf_counter()
+                    
+                    probs = pipe.predict_proba(feature_window)[0]
+
+                    task_proba = np.max(probs)
+
+                    if task_proba < self.task_threshold:
+                        y_pred = REJECT_LABEL
+                    else:
+                        y_pred = probs.argmax()
+
+                    t_end = time.perf_counter()
+
+                    t_task_predict = t_end - t_start
+
+                    correct = (y_pred == y_test[window])
+
+                    res = {
+                        "dataset": self.dataset,
+                        "subject": subject,
+                        "session": sess,
+                        "method": self.method,
+                        "pipeline": name,
+                        "window": window,
+                        "window_start": window_start,
+                        "window_end": window_end,
+                        "is_idle": idle_window,
+                        "t_transform": t_transform,
+                        "t_idle_detect": t_idle_detect,
+                        "t_task_predict": t_task_predict,
+                        "t_predict": (t_transform + t_idle_detect + t_task_predict),
+                        "y_pred": y_pred,
+                        "idle_proba": idle_proba,
+                        "task_proba": task_proba,
+                        "y_true": y_test[window],
+                        "correct": correct
+                    }
+
+                    self.results_.append(res)
+            else:
+                y_pred = REST_LABEL
+                t_task_predict = 0
+                correct = (y_pred == y_test[window])
+
+                res = {
+                    "dataset": self.dataset,
+                    "subject": subject,
+                    "session": sess,
+                    "method": self.method,
+                    "pipeline": "idle",
+                    "window": window,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "is_idle": idle_window,
+                    "t_transform": t_transform,
+                    "t_idle_detect": t_idle_detect,
+                    "t_task_predict": t_task_predict,
+                    "t_predict": (t_transform + t_idle_detect + t_task_predict),
+                    "y_pred": y_pred,
+                    "idle_proba": idle_proba,
+                    "task_proba": task_proba,
+                    "y_true": y_test[window],
+                    "correct": correct
+                }
+
+                self.results_.append(res)
 
     def evaluate(self):
         """
         Main function for processing data.
         """
+
+        self.idle_detector = IdleDetection()
 
         for subject in self.subjects:
             if subject not in self.dataset.subject_list:
@@ -293,57 +408,68 @@ class PseudoOnlineEvaluation():
 
                         if (self.no_run):
                             return X_train, y_train, X_test, y_test
+                        
+                        # feature pipeline training
+                        t_start = time.perf_counter()
+                        self.feature_pipeline.fit(X_train, y_train)
+                        t_end = time.perf_counter()
 
-                        for name, pipe in self.pipelines.items():
+                        t_feature_train = t_end - t_start
+
+                        res = {
+                            "pipeline": "feature",
+                            "method": self.method,
+                            "t_train": t_feature_train
+                                
+                        }
+
+                        self.model_results_.append(res)
+                        
+                        X_train = self.feature_pipeline.transform(X_train)
+                        
+                        # idle detector training
+                        t_start = time.perf_counter()
+                        self.idle_detector.fit(X_train, y_train)
+                        t_end = time.perf_counter()
+
+                        t_idle_train = t_end - t_start
+
+                        res = {
+                            "pipeline": "idle",
+                            "method": self.method,
+                            "t_train": t_idle_train
+                            
+                        }
+
+                        self.model_results_.append(res)
+
+                        # mask for task windows
+                        mask = y_train != REST_LABEL
+                        X_task = X_train[mask]
+                        y_task = y_train[mask]
+                        
+                        # task classifier training
+                        for name, model in self.class_pipelines:
+                            print("Fitting task classifier...")
                             t_start = time.perf_counter()
+                            model.fit(X_task, y_task)
+                            t_end = time.perf_counter()
 
-                            print("Fitting...")
-                            pipe.fit(X_train, y_train)
+                            t_train = t_end - t_start
                             print("Done fitting!")
 
-                            t_end = time.perf_counter()
-                            t_train = t_end - t_start
-
-
-                            print(f"Fitting time: {t_train}")
-
-                            predictions = []
-                            mcc_acc = []
-
-                            for window in range(len(X_test)):
-                                window_start = times_test[window][0]
-                                window_end = times_test[window][1]
-
-                                t_start = time.perf_counter()
-
-                                y_pred = pipe.predict([X_test[window]])[0]
-
-                                t_end = time.perf_counter()
-
-                                predictions.append(y_pred)
-                                t_predict = t_end - t_start
-
-                                mcc_acc = matthews_corrcoef(y_test[:window+1], predictions[:window+1]) # accumulated mcc score until this window
-
-                                res = {
-                                    "dataset": self.dataset,
-                                    "subject": subject,
-                                    "session": sess,
-                                    "method": self.method,
-                                    "pipeline": name,
-                                    "t_train": t_train,
-                                    "window": window,
-                                    "window_start": window_start,
-                                    "window_end": window_end,
-                                    "t_predict": t_predict,
-                                    "y_pred": y_pred,
-                                    "y_true": y_test[window],
-                                    "correct": (predictions[window] == y_test[window]),
-                                    "mcc_acc": mcc_acc
-                                }
+                            res = {
+                                "pipeline": name,
+                                "method": self.method,
+                                "t_train": t_train
                                 
-                                self.results_.append(res)
+                            }
 
+                            self.model_results_.append(res)
+
+                        self.window_process(subject, sess, X_test, y_test, times_test)
+            
+            
                 elif self.method == 'inter-session':
                     if self.dataset.n_sessions > 1:
                         session_split = int(self.ratio * self.dataset.n_sessions)
@@ -393,90 +519,97 @@ class PseudoOnlineEvaluation():
 
                         X_train, y_train, times_train = wgen_train.generate_windows()
 
-                        if(self.no_run):
-                            return X_train, y_train
-                            
-                        print(f"Fitting in sessions: {train_sessions}...")
+                        if (self.no_run):
+                            return X_train, y_train, X_test, y_test
+                        
+                        # feature pipeline training
+                        t_start = time.perf_counter()
+                        self.feature_pipeline.fit(X_train, y_train)
+                        t_end = time.perf_counter()
 
-                        for name, pipe in self.pipelines.items():
-                            print(f"Pipeline: {name}")
-                            print("FItting...")
+                        t_feature_train = t_end - t_start
+
+                        res = {
+                            "pipeline": "feature",
+                            "method": self.method,
+                            "t_train": t_feature_train
+                                
+                        }
+
+                        self.model_results_.append(res)
+                        
+                        X_train = self.feature_pipeline.transform(X_train)
+                        
+                        # idle detector training
+                        t_start = time.perf_counter()
+                        self.idle_detector.fit(X_train, y_train)
+                        t_end = time.perf_counter()
+
+                        t_idle_train = t_end - t_start
+
+                        res = {
+                            "pipeline": "idle",
+                            "method": self.method,
+                            "t_train": t_idle_train
+                            
+                        }
+
+                        self.model_results_.append(res)
+
+                        # mask for task windows
+                        mask = y_train != REST_LABEL
+                        X_task = X_train[mask]
+                        y_task = y_train[mask]
+
+                        # task classifier training
+                        for name, model in self.class_pipelines:
+                            print("Fitting task classifier...")
                             t_start = time.perf_counter()
-
-                            pipe.fit(X_train, y_train)
-
+                            model.fit(X_task, y_task)
                             t_end = time.perf_counter()
-                            print("Done fitting!")
+
                             t_train = t_end - t_start
+                            print("Done fitting!")
 
-                            predictions = []
-                            y_all = []
-                            mcc_acc = []
+                            res = {
+                                "pipeline": name,
+                                "method": self.method,
+                                "t_train": t_train
+                                
+                            }
+
+                            self.model_results_.append(res)
                             
-                            for sess in test_sessions:
-                                print(f"Testing in session {sess}...")
+                        for sess in test_sessions:
+                            print(f"Testing in session {sess}...")
 
-                                raws = self.raw_concat(raws_test[sess])
+                            raws = self.raw_concat(raws_test[sess])
 
-                                events, event_ids = mne.events_from_annotations(raws)
+                            events, event_ids = mne.events_from_annotations(raws)
 
-                                wgen_test = PseudoOnlineWindow(raw=raws,
-                                                                    events=events,
-                                                                    interval=self.dataset.interval,
-                                                                    task_ids=event_ids,
-                                                                    window_size=self.wsize,
-                                                                    window_step=self.wstep
-                                                                    )
-                                    
-                                X_test, y_test, times_test = wgen_test.generate_windows()
+                            wgen_test = PseudoOnlineWindow(raw=raws,
+                                                                events=events,
+                                                                interval=self.dataset.interval,
+                                                                task_ids=event_ids,
+                                                                window_size=self.wsize,
+                                                                window_step=self.wstep
+                                                                )
+                                
+                            X_test, y_test, times_test = wgen_test.generate_windows()
 
-                                predictions_sess = []
-
-                                print("X_train:", len(X_train), "X_test:", len(X_test))
-                                print("y_train:", len(y_train), "y_test:", len(y_test))
-
-
-                                for window in range(len(X_test)):
-                                    print(f"Testing on window {window}")
-                                    #tempos de inicio e fim da janela, pode ser util pra plot
-                                    window_start = times_test[window][0]
-                                    window_end = times_test[window][1]
-
-
-                                    t_start = time.perf_counter()
-                                    y_pred = pipe.predict([X_test[window]])[0]
-                                    t_end = time.perf_counter()
-
-                                    t_predict = t_end - t_start
-
-                                    predictions_sess.append(y_pred)
-                                    predictions.append(y_pred)
-                                    y_all.append(y_test[window])
-
-                                    mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
-                                    mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
-
-                                    res = {
-                                    "dataset": self.dataset,
-                                    "subject": subject,
-                                    "session": sess,
-                                    "method": self.method,
-                                    "pipeline": name,
-                                    "t_train": t_train,
-                                    "window": window,
-                                    "window_start": window_start,
-                                    "window_end": window_end,
-                                    "t_predict": t_predict,
-                                    "y_pred": y_pred,
-                                    "y_true": y_test[window],
-                                    "correct": (predictions_sess[window] == y_test[window]),
-                                    "mcc_acc_sess": mcc_acc_sess,
-                                    "mcc_acc": mcc_acc
-                                    }
-
-                                    self.results_.append(res)
+                            self.window_process(subject, sess, X_test, y_test, times_test)
                     else:
                         raise ValueError("There are not enough sessions for evaluation.")
-        if len(self.results_):
-            self.results_ = pd.DataFrame(self.results_)
-            self.results_.to_csv(f"results-S{subject}.csv", index=False)
+                    
+            if len(self.results_):
+                self.results_ = pd.DataFrame(self.results_)
+                self.results_.to_csv(f"results-S{subject}.csv", index=False)
+            if len(self.model_results_):
+                self.model_results_ = pd.DataFrame(self.model_results_)
+                self.model_results_.to_csv(f"model-results-S{subject}.csv", index=False)
+
+
+
+            
+                                   # mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
+                                   # mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
