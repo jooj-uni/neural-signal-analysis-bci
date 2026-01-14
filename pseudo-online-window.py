@@ -145,8 +145,8 @@ class IdleBaseline(BaseEstimator, TransformerMixin):
             Baseline corrected windowed data.
     """
 
-    def __init__(self, rest_label=0):
-        self.rest_label = 0
+    def __init__(self, rest_label=REST_LABEL):
+        self.rest_label = rest_label
 
     def fit(self, X, y=None):
         if y is None:
@@ -202,13 +202,19 @@ class IdleDetection():
     def is_idle(self, window):
         p_idle = self.model.predict_proba(window)[0, 0]
 
-        return 0 if (p_idle < self.threshold) else 1, p_idle
+        if p_idle < self.threshold:
+            return 0, p_idle
+        else:
+            return 1, p_idle
 
 
 class PseudoOnlineEvaluation():
     """
     Evaluates windowed data in pseudo-online manner (simulating real time asynchronous BCI). It can be done within-session, evaluating only one session data, or inter-session, evaluating performance across sessions, without
-    breaking signal causality.
+    breaking signal causality. 
+
+    Feature pipeline should only be used to apply transformers common to all classification pipelines (such as IdleBaseline and PSD). The result in feature_pipeline has to preserve (n_samples, n_x, n_y) shape. If no feature_pipeline
+    is present, idle_detector will user reshaped data, and all classification pipelines will have to use a FunctionTransformer to reshape data, if only the classifier is used.
 
     Parameters:
         dataset: MOABB dataset
@@ -271,7 +277,8 @@ class PseudoOnlineEvaluation():
             if (self.feature_pipeline != None):
                 feature_window = self.feature_pipeline.transform([X_test[window]])
             else:
-                feature_window = [X_test[window]]
+                feature_window = np.array([X_test[window]])
+                idle_window = np.reshape(feature_window, (feature_window.shape[0], -1))
 
             t_end = time.perf_counter()
 
@@ -279,7 +286,7 @@ class PseudoOnlineEvaluation():
 
             t_start = time.perf_counter()
             
-            idle_window, idle_proba = self.idle_detector.is_idle(feature_window)
+            idle_window, idle_proba = self.idle_detector.is_idle(idle_window)
 
             t_end = time.perf_counter()
             t_idle_detect = t_end - t_start
@@ -287,9 +294,9 @@ class PseudoOnlineEvaluation():
             task_proba = None
 
             if not idle_window:
-                for name, pipe in self.class_pipelines:
+                for name, pipe in self.class_pipelines.items():
                     t_start = time.perf_counter()
-                    
+
                     probs = pipe.predict_proba(feature_window)[0]
 
                     task_proba = np.max(probs)
@@ -360,7 +367,7 @@ class PseudoOnlineEvaluation():
         Main function for processing data.
         """
 
-        self.idle_detector = IdleDetection()
+        self.idle_detector = IdleDetection(LogisticRegression())
 
         for subject in self.subjects:
             if subject not in self.dataset.subject_list:
@@ -410,26 +417,29 @@ class PseudoOnlineEvaluation():
                             return X_train, y_train, X_test, y_test
                         
                         # feature pipeline training
-                        t_start = time.perf_counter()
-                        self.feature_pipeline.fit(X_train, y_train)
-                        t_end = time.perf_counter()
+                        if (self.feature_pipeline != None):
+                          t_start = time.perf_counter()
+                          self.feature_pipeline.fit(X_train, y_train)
+                          t_end = time.perf_counter()
 
-                        t_feature_train = t_end - t_start
+                          t_feature_train = t_end - t_start
 
-                        res = {
-                            "pipeline": "feature",
-                            "method": self.method,
-                            "t_train": t_feature_train
-                                
-                        }
+                          res = {
+                              "pipeline": "feature",
+                              "method": self.method,
+                              "t_train": t_feature_train
+                                  
+                          }
 
-                        self.model_results_.append(res)
-                        
-                        X_train = self.feature_pipeline.transform(X_train)
-                        
+                          self.model_results_.append(res)
+                          
+                          X_train = self.feature_pipeline.transform(X_train)
+                          
                         # idle detector training
+                        if (self.feature_pipeline == None):
+                            idle_train = np.reshape(X_train, (X_train.shape[0], -1))
                         t_start = time.perf_counter()
-                        self.idle_detector.fit(X_train, y_train)
+                        self.idle_detector.fit(idle_train, y_train)
                         t_end = time.perf_counter()
 
                         t_idle_train = t_end - t_start
@@ -449,7 +459,7 @@ class PseudoOnlineEvaluation():
                         y_task = y_train[mask]
                         
                         # task classifier training
-                        for name, model in self.class_pipelines:
+                        for name, model in self.class_pipelines.items():
                             print("Fitting task classifier...")
                             t_start = time.perf_counter()
                             model.fit(X_task, y_task)
@@ -562,7 +572,7 @@ class PseudoOnlineEvaluation():
                         y_task = y_train[mask]
 
                         # task classifier training
-                        for name, model in self.class_pipelines:
+                        for name, model in self.class_pipelines.items():
                             print("Fitting task classifier...")
                             t_start = time.perf_counter()
                             model.fit(X_task, y_task)
@@ -602,11 +612,13 @@ class PseudoOnlineEvaluation():
                         raise ValueError("There are not enough sessions for evaluation.")
                     
             if len(self.results_):
-                self.results_ = pd.DataFrame(self.results_)
-                self.results_.to_csv(f"results-S{subject}.csv", index=False)
+                results_ = pd.DataFrame(self.results_)
+                results_.to_csv(f"results-S{subject}.csv", index=False)
+                self.results_ = []
             if len(self.model_results_):
-                self.model_results_ = pd.DataFrame(self.model_results_)
-                self.model_results_.to_csv(f"model-results-S{subject}.csv", index=False)
+                model_results_ = pd.DataFrame(self.model_results_)
+                model_results_.to_csv(f"model-results-S{subject}.csv", index=False)
+                self.model_results_ = []
 
 
 
