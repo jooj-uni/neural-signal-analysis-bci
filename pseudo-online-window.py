@@ -213,9 +213,6 @@ class PseudoOnlineEvaluation():
     Evaluates windowed data in pseudo-online manner (simulating real time asynchronous BCI). It can be done within-session, evaluating only one session data, or inter-session, evaluating performance across sessions, without
     breaking signal causality. 
 
-    Feature pipeline should only be used to apply transformers common to all classification pipelines (such as IdleBaseline and PSD). The result in feature_pipeline has to preserve (n_samples, n_x, n_y) shape. If no feature_pipeline
-    is present, idle_detector will user reshaped data, and all classification pipelines will have to use a FunctionTransformer to reshape data, if only the classifier is used.
-
     Parameters:
         dataset: MOABB dataset
             Dataset to be used. It has to be a MOABB dataset object.
@@ -237,20 +234,25 @@ class PseudoOnlineEvaluation():
             Confidence threshold for classification.
         
     """
-    def __init__(self, dataset, class_pipelines, method, wsize, wstep, subjects, feature_pipeline=None, ratio=0.7, threshold=0.6, no_run=False):
+    def __init__(self, dataset, class_pipelines, method, wsize, wstep, subjects, idle_pipelines=None, two_stage=True, ratio=0.7, idle_threshold=0.6, task_threshold=0.6, no_run=False):
         self.dataset = dataset
-        self.feature_pipeline = feature_pipeline
         self.class_pipelines = class_pipelines
         self.ratio = ratio
         self.method = method
         self.wsize = wsize
         self.wstep = wstep
         self.subjects = subjects
-        self.task_threshold = threshold
+        self.idle_threshold = idle_threshold
+        self.task_threshold = task_threshold
         self.no_run = no_run
+        self.idle_pipelines = idle_pipelines
+        self.two_stage = two_stage
         
         self.results_ = []
         self.model_results_ = []
+
+        if self.two_stage is True and self.idle_pipelines is None:
+            raise AttributeError("Evaluation is set to two stage but has no idle_pipeline")
 
     def raw_concat(self, raw_list):
         """
@@ -272,6 +274,9 @@ class PseudoOnlineEvaluation():
             window_start = times_test[window][0]
             window_end = times_test[window][1]
 
+            pipe_window = np.array([X_test[window]])
+
+            """
             t_start = time.perf_counter()
 
             if (self.feature_pipeline != None):
@@ -283,23 +288,97 @@ class PseudoOnlineEvaluation():
             t_end = time.perf_counter()
 
             t_transform = t_end - t_start
+            """
 
             t_start = time.perf_counter()
             
-            idle_window, idle_proba = self.idle_detector.is_idle(idle_window)
+            if self.two_stage is True:
+                for idle_name, idle_pipe in self.idle_pipelines.items():
+                    idle_proba = idle_pipe.predict_proba(pipe_window)[0, 0]
 
-            t_end = time.perf_counter()
-            t_idle_detect = t_end - t_start
+                    is_idle = 0 if idle_proba < self.idle_threshold else 1
 
-            task_proba = None
+                    t_end = time.perf_counter()
+                    t_idle_detect = t_end - t_start
 
-            if not idle_window:
+                    task_proba = None
+
+                    if not is_idle:
+                        for name, pipe in self.class_pipelines.items():
+                            t_start = time.perf_counter()
+
+                            probs = pipe.predict_proba(pipe_window)[0]
+
+                            task_proba = np.max(probs)
+
+                            if task_proba < self.task_threshold:
+                                y_pred = REJECT_LABEL
+                            else:
+                                y_pred = probs.argmax()
+
+                            t_end = time.perf_counter()
+
+                            t_task_predict = t_end - t_start
+
+                            correct = (y_pred == y_test[window])
+
+                            res = {
+                                "dataset": self.dataset,
+                                "subject": subject,
+                                "session": sess,
+                                "method": self.method,
+                                "idle_pipeline": idle_name,
+                                "task_pipeline": name,
+                                "window": window,
+                                "window_start": window_start,
+                                "window_end": window_end,
+                                "is_idle": is_idle,
+                                "t_idle_detect": t_idle_detect,
+                                "t_task_predict": t_task_predict,
+                                "t_predict": (t_idle_detect + t_task_predict),
+                                "y_pred": y_pred,
+                                "idle_proba": idle_proba,
+                                "task_proba": task_proba,
+                                "y_true": y_test[window],
+                                "correct": correct
+                            }
+
+                            self.results_.append(res)
+                    else:
+                        y_pred = REST_LABEL
+                        t_task_predict = 0
+                        correct = (y_pred == y_test[window])
+
+                        res = {
+                            "dataset": self.dataset,
+                            "subject": subject,
+                            "session": sess,
+                            "method": self.method,
+                            "idle_pipeline": idle_name,
+                            "task_pipeline": None,
+                            "window": window,
+                            "window_start": window_start,
+                            "window_end": window_end,
+                            "is_idle": is_idle,
+                            "t_idle_detect": t_idle_detect,
+                            "t_task_predict": t_task_predict,
+                            "t_predict": (t_idle_detect + t_task_predict),
+                            "y_pred": y_pred,
+                            "idle_proba": idle_proba,
+                            "task_proba": task_proba,
+                            "y_true": y_test[window],
+                            "correct": correct
+                        }
+
+                        self.results_.append(res)
+            else:
                 for name, pipe in self.class_pipelines.items():
                     t_start = time.perf_counter()
 
-                    probs = pipe.predict_proba(feature_window)[0]
+                    probs = pipe.predict_proba(pipe_window)[0]
 
                     task_proba = np.max(probs)
+                    idle_proba = probs[0]
 
                     if task_proba < self.task_threshold:
                         y_pred = REJECT_LABEL
@@ -317,15 +396,15 @@ class PseudoOnlineEvaluation():
                         "subject": subject,
                         "session": sess,
                         "method": self.method,
-                        "pipeline": name,
+                        "idle_pipeline": name,
+                        "task_pipeline": name,
                         "window": window,
                         "window_start": window_start,
                         "window_end": window_end,
-                        "is_idle": idle_window,
-                        "t_transform": t_transform,
-                        "t_idle_detect": t_idle_detect,
+                        "is_idle": int(y_pred == REST_LABEL),
+                        "t_idle_detect": t_task_predict if y_pred == REST_LABEL else None,
                         "t_task_predict": t_task_predict,
-                        "t_predict": (t_transform + t_idle_detect + t_task_predict),
+                        "t_predict": t_task_predict,
                         "y_pred": y_pred,
                         "idle_proba": idle_proba,
                         "task_proba": task_proba,
@@ -334,40 +413,67 @@ class PseudoOnlineEvaluation():
                     }
 
                     self.results_.append(res)
-            else:
-                y_pred = REST_LABEL
-                t_task_predict = 0
-                correct = (y_pred == y_test[window])
 
-                res = {
-                    "dataset": self.dataset,
-                    "subject": subject,
-                    "session": sess,
-                    "method": self.method,
-                    "pipeline": "idle",
-                    "window": window,
-                    "window_start": window_start,
-                    "window_end": window_end,
-                    "is_idle": idle_window,
-                    "t_transform": t_transform,
-                    "t_idle_detect": t_idle_detect,
-                    "t_task_predict": t_task_predict,
-                    "t_predict": (t_transform + t_idle_detect + t_task_predict),
-                    "y_pred": y_pred,
-                    "idle_proba": idle_proba,
-                    "task_proba": task_proba,
-                    "y_true": y_test[window],
-                    "correct": correct
-                }
+    def idle_train(self, X_train, y_train):
+        y_idle = (y_train == REST_LABEL).astype(int)
 
-                self.results_.append(res)
+        for name, pipe in self.idle_pipelines.items():
+            print(f"fitting idle pipeline {name}...")
+
+            t_start = time.perf_counter()
+            pipe.fit(X_train, y_idle)
+            t_end = time.perf_counter()
+
+            t_idle_train = t_end - t_start
+
+            res = {
+                "idle_pipeline": name,
+                "method": self.method,
+                "t_train": t_idle_train
+                
+            }
+
+            self.model_results_.append(res)
+
+            print("done fitting idle detector")
+        return self
+
+    def task_train(self, X_train, y_train):
+        if self.two_stage is True:
+            # mask for task windows
+            mask = y_train != REST_LABEL
+            X_task = X_train[mask]
+            y_task = y_train[mask]
+        else:
+            X_task = X_train
+            y_task = y_train
+
+        # task classifier training
+        for name, pipe in self.class_pipelines.items():
+            print(f"Fitting task pipeline {name}...")
+            t_start = time.perf_counter()
+            pipe.fit(X_task, y_task)
+            t_end = time.perf_counter()
+
+            t_train = t_end - t_start
+            print("Done fitting!")
+
+            res = {
+                "task_pipeline": name,
+                "method": self.method,
+                "t_train": t_train
+                
+            }
+
+            self.model_results_.append(res)
+
+        return self
+
 
     def evaluate(self):
         """
         Main function for processing data.
         """
-
-        self.idle_detector = IdleDetection(LogisticRegression())
 
         for subject in self.subjects:
             if subject not in self.dataset.subject_list:
@@ -416,66 +522,10 @@ class PseudoOnlineEvaluation():
                         if (self.no_run):
                             return X_train, y_train, X_test, y_test
                         
-                        # feature pipeline training
-                        if (self.feature_pipeline != None):
-                          t_start = time.perf_counter()
-                          self.feature_pipeline.fit(X_train, y_train)
-                          t_end = time.perf_counter()
+                        if self.two_stage is True:
+                            self.idle_train(X_train, y_train)
 
-                          t_feature_train = t_end - t_start
-
-                          res = {
-                              "pipeline": "feature",
-                              "method": self.method,
-                              "t_train": t_feature_train
-                                  
-                          }
-
-                          self.model_results_.append(res)
-                          
-                          X_train = self.feature_pipeline.transform(X_train)
-                          
-                        # idle detector training
-                        if (self.feature_pipeline == None):
-                            idle_train = np.reshape(X_train, (X_train.shape[0], -1))
-                        t_start = time.perf_counter()
-                        self.idle_detector.fit(idle_train, y_train)
-                        t_end = time.perf_counter()
-
-                        t_idle_train = t_end - t_start
-
-                        res = {
-                            "pipeline": "idle",
-                            "method": self.method,
-                            "t_train": t_idle_train
-                            
-                        }
-
-                        self.model_results_.append(res)
-
-                        # mask for task windows
-                        mask = y_train != REST_LABEL
-                        X_task = X_train[mask]
-                        y_task = y_train[mask]
-                        
-                        # task classifier training
-                        for name, model in self.class_pipelines.items():
-                            print("Fitting task classifier...")
-                            t_start = time.perf_counter()
-                            model.fit(X_task, y_task)
-                            t_end = time.perf_counter()
-
-                            t_train = t_end - t_start
-                            print("Done fitting!")
-
-                            res = {
-                                "pipeline": name,
-                                "method": self.method,
-                                "t_train": t_train
-                                
-                            }
-
-                            self.model_results_.append(res)
+                        self.task_train(X_train, y_train)
 
                         self.window_process(subject, sess, X_test, y_test, times_test)
             
@@ -532,63 +582,10 @@ class PseudoOnlineEvaluation():
                         if (self.no_run):
                             return X_train, y_train, X_test, y_test
                         
-                        # feature pipeline training
-                        t_start = time.perf_counter()
-                        self.feature_pipeline.fit(X_train, y_train)
-                        t_end = time.perf_counter()
+                        if self.two_stage is True:
+                            self.idle_train(X_train, y_train)
 
-                        t_feature_train = t_end - t_start
-
-                        res = {
-                            "pipeline": "feature",
-                            "method": self.method,
-                            "t_train": t_feature_train
-                                
-                        }
-
-                        self.model_results_.append(res)
-                        
-                        X_train = self.feature_pipeline.transform(X_train)
-                        
-                        # idle detector training
-                        t_start = time.perf_counter()
-                        self.idle_detector.fit(X_train, y_train)
-                        t_end = time.perf_counter()
-
-                        t_idle_train = t_end - t_start
-
-                        res = {
-                            "pipeline": "idle",
-                            "method": self.method,
-                            "t_train": t_idle_train
-                            
-                        }
-
-                        self.model_results_.append(res)
-
-                        # mask for task windows
-                        mask = y_train != REST_LABEL
-                        X_task = X_train[mask]
-                        y_task = y_train[mask]
-
-                        # task classifier training
-                        for name, model in self.class_pipelines.items():
-                            print("Fitting task classifier...")
-                            t_start = time.perf_counter()
-                            model.fit(X_task, y_task)
-                            t_end = time.perf_counter()
-
-                            t_train = t_end - t_start
-                            print("Done fitting!")
-
-                            res = {
-                                "pipeline": name,
-                                "method": self.method,
-                                "t_train": t_train
-                                
-                            }
-
-                            self.model_results_.append(res)
+                        self.task_train(X_train, y_train)
                             
                         for sess in test_sessions:
                             print(f"Testing in session {sess}...")
