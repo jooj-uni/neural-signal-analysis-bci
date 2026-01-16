@@ -6,6 +6,8 @@ from sklearn.metrics import matthews_corrcoef
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.linear_model import LogisticRegression
 
+from scipy.signal import butter, lfilter
+
 import time
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -162,10 +164,36 @@ class IdleBaseline(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         return np.subtract(X, self.baseline_)
+    
 
+class ArrayFilter(BaseEstimator, TransformerMixin):
+    """
+    If output is used directly on classifier, function transformer to reshape data needs to be used.
+    """
+    def __init__(self, sfreq, lfreq, hfreq):
+        self.sfreq = sfreq
+        self.lfreq = lfreq
+        self.hfreq = hfreq
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        b, a = butter(
+        N=4,
+        Wn=[self.lfreq, self.hfreq],
+        btype='bandpass',
+        fs=self.sfreq
+        )
+
+        X_filt = lfilter(b, a, X, axis=-1)
+
+        return np.array(X_filt)
 
 class PSD(BaseEstimator, TransformerMixin):
-
+    """
+    If output is used directly on classifier, function transformer to reshape data needs to be used.
+    """
     def __init__(self, sfreq, fmin=0, fmax=None):
         self.sfreq = sfreq
         self.fmin = fmin
@@ -178,18 +206,29 @@ class PSD(BaseEstimator, TransformerMixin):
         
         fmax = self.fmax if self.fmax is not None else self.sfreq / 2
 
+        n_seg = int(len(X[0, 0, :])/2)
+        if n_seg > 256:
+            n_fft = n_seg
+        else:
+            n_fft = 256
+
         psds, _ = mne.time_frequency.psd_array_welch(X, 
                                                      sfreq=self.sfreq,
                                                      fmin=self.fmin,
                                                      fmax=self.fmax,
+                                                     n_per_seg=n_seg,
+                                                     n_fft=n_fft,
                                                      average='mean')
         
-        return psds
+        psds = np.array(psds)
         
+        return psds
+
+"""
+deprecated
+
 class IdleDetection():
-    """
-    Classifier for idle state detection.
-    """
+    #Classifier for idle state detection.
     def __init__(self, model, threshold=0.6):
         self.threshold = threshold
         self.model = model
@@ -206,7 +245,7 @@ class IdleDetection():
             return 0, p_idle
         else:
             return 1, p_idle
-
+"""
 
 class PseudoOnlineEvaluation():
     """
