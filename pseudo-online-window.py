@@ -2,88 +2,662 @@ import numpy as np
 import moabb
 import mne
 
+from sklearn.metrics import matthews_corrcoef
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.linear_model import LogisticRegression
+
+from scipy.signal import butter, lfilter
+
+import time
+import matplotlib.pyplot as plt
+import pandas as pd
+
+REST_LABEL = 0
+REJECT_LABEL = -1
+
 class PseudoOnlineWindow():
     """
-    a classe cria as janelas e as rotula baseado na proporção de imagética e não imagética
-    os dados Raw devem ser extraídos do dataset com get_data() antes
-    os outros parametros do init podem ser extraídos do objeto dataset também, a nao ser os params de window, que são definidos a gosto
+    Segments data in windows for pseudo-online analysis.
 
-    ******* nao testei ainda!!!! pois ainda não tá muito claro pra mim como extrair os eventos do dataset no moabb, na classe levei em conta o array de eventos, típico do mne, mas não sei
-    como extrair isso no moabb ainda.
 
-    acho que deve ter um jeito mais elegante de escrever esse codigo, mas por enquanto...
-
-    *******************************arrumar para logica funcionar por amostras e nao tempo************************************
+    Parameters:
+        raw: mne.Raw object
+            The continuous data.
+        events: arra
+            MNE event array.
+        interval: list
+            Dataset parameter defining imagery interval.
+        task_ids: dict
+            Defines the tasks and its numeric IDs. It can be used to select a subset of the dataset tasks.
+        window_size: float
+            The window size in seconds.
+        window_step: int
+            Distance in seconds between the start of two consecutive windows. It can be used to set superposition between windows, when value is lower than window_size.
+    
     """
-    def __init__(self, raw, events, interval, task_ids, window_size, window_step):
+    def __init__(self, raw, events, interval, task_ids, window_size, window_step, chan_list=None):
         self.raw = raw
         self.events = events
         self.interval = interval
         self.sfreq = raw.info['sfreq']
         self.task_ids = task_ids
-        self.window_size = window_size
-        self.window_step = window_step
 
-        #extrai tempos de começo e fim da imagetica (considerando um o periodo fixo de imagetica determinado no interval)
-        self.task_times = [
-            (ev[0] / self.sfreq + interval[0],
-             ev[0] / self.sfreq + interval[1],
-             ev[2])
-            for ev in events if ev[2] in task_ids
-        ]
+        self.window_size = int(window_size * self.sfreq)
+        self.window_step = int(window_step * self.sfreq)
+        self.chan_list = chan_list
+
+        self.t_start = int(interval[0] * self.sfreq)
+        self.t_end = int(interval[1] * self.sfreq)
+
+        self.labels = self.generate_labels()
+
+    def generate_labels(self):
+        """
+        Attributes aa label for each sample. The label vector is initialized with 0 and each data point is attributed to the task label, if it is in imagery period.
+
+        Returns:
+            labels: nd array
+                Label vector containing labels for each data sample.
+        """
         
-        self.task_intervals = [(np.arange(t0, t1), ev) for t0, t1, ev in self.task_times]
+        n_samples = self.raw.n_times
+        labels = np.zeros(n_samples, dtype=int)
 
-    def label_window(self, start, stop):
+        valid_ids = list(self.task_ids.values())
+
+        for ev in self.events:
+            ev_idx, _, ev_id = ev
+
+            if ev_id in valid_ids:
+                # uses only imagery period for task attribution
+                start = ev_idx + self.t_start
+                stop = ev_idx + self.t_end
+
+                # ensure array limits
+                start = max(0, start)
+                stop = min(n_samples, stop)
+
+                labels[start:stop] = ev_id
+        return labels
+
+
+    def generate_windows(self):
         """
-        atribui os labels para cada janela
-            0: nothing -> se a maior parte nao representa imagetica
-            1: imagetica -> se a maior parte representa imagetica
-        se ambos os rotulos (nothing ou task_id) tiverem mesma proporcao, atribui para a janela o rotulo mais posterior 
-
-        a principio to considerando que vai acontecer de duas uma: o sujeito nao tenta controlar ou o sujeito tenta controlar, mas nao to considerando qual a imagetica que ele ta tentando performar, apenas se teve uma task (qualquer que seja)
-
-        ***** ainda da pra otimizar
-        ***** essa funcao leva em conta que uma janela vai conter no maximo uma task; precisa adaptar se for considerar janelas grandes o suficiente para abarcar mais de 1 task
-
-        """
-
+        Generates and labels windows.
         
-        window_times = np.arange(start, stop)#***********arrumar para calcular em amostras
-
-        nothing_qt = [p for p in window_times if not any(p in q for q, _ in self.task_intervals)]
-        nothing_prop = len(nothing_qt)/self.window_size
-
-
-        if nothing_prop > 0.5:
-            return 0
-        elif nothing_prop < 0.5:
-            for p in window_times:
-                for q, ev in self.task_intervals:
-                    if p in q: return ev
-        else:
-            for t0, _, ev_id in self.task_times:
-                return ev_id if t0 in window_times else 0 #se t0 ta em window_times, a task é a classe posterior; se t1 ta em window_times, nothing é posterior
-
-
-    def generate_window(self):
-        X, Y, times = [], [], []
-
+        Returns:
+            X: nd array shape=(n_windows, n_channels, n_times)
+                The windows (data).
+            y: nd array
+                Window labels in the same order as X.
+            times: nd array
+                Array of tuples. Each tuple is the timestamps (start and end) of each window. Might be useful for plotting.
         """
-        loop para pegar os indices de inicios das janelas
-        o arange gera de 0 (inicio dos dados) ate tempo total (ultimo dado) - uma janela, para evitar acesso inválido
-        """
-        for start in np.arange(0, self.raw.times[-1] - self.window_size, self.window_step):
-            stop = start + self.window_size
+        X, y, times = [], [], []
 
-            data = self.raw.get_data(
-                start=int(start * self.sfreq),
-                stop=int(stop * self.sfreq)
-            )
+        data = self.raw.get_data()
+        n_samples = data.shape[1]
 
-            label = self.label_window(start, stop)
-            X.append(data)
-            Y.append(label)
-            times.append((start, stop))
-        return np.array(X), np.array(Y), np.array(times)
+        for start_idx in range (0, n_samples - self.window_size, self.window_step):
+            end_idx = start_idx + self.window_size
+
+            if self.chan_list == None:
+                window_data = data[:, start_idx : end_idx]
+                window_labels = self.labels[start_idx:end_idx]
+            else:   #channel selection
+                window_data = []
+                for chan in self.chan_list:
+                    if chan in self.raw.ch_names:
+                        window_data.append(data[chan, start_idx : end_idx])
+                    else:
+                        raise ValueError(f"Channel {chan} is not in {self.raw.ch_names}")
+                window_labels = self.labels[start_idx:end_idx]
+
+            count = np.bincount(window_labels)
+            major = np.argmax(count)
+
+            prop_major = count[major] / len(window_labels)
+
+            # class draw proportion
+            n_classes = len(np.unique(window_labels))
+            draw_prop = 1 / n_classes
+
+            # in case of draw, the posterior label wins
+            if prop_major != draw_prop:
+                y.append(major)
+            else:
+                y.append(window_labels[-1])
+
+            X.append(window_data)
+            times.append(((start_idx / self.sfreq), (end_idx / self.sfreq)))
+
+        return np.array(X), np.array(y), np.array(times)
+
+
+class IdleBaseline(BaseEstimator, TransformerMixin):
+    """
+    Applies baseline correction. It uses a fixed baseline. This transformer has to be applied to windowed data.
+
+    Parameters:
+        rest_label: int
+            Label representing idle state.
     
+    Returns:
+        X: nd array shape=(n_windows, n_channels, n_times)
+            Baseline corrected windowed data.
+    """
+
+    def __init__(self, rest_label=REST_LABEL):
+        self.rest_label = rest_label
+
+    def fit(self, X, y=None):
+        if y is None:
+            raise ValueError("Missing labels array")
+        
+        idle_windows = (y == self.rest_label)
+
+        if not np.any(idle_windows):
+            raise ValueError("There are no rest windows")
+        
+        self.baseline_ = X[idle_windows].mean(axis=0)
+        return self
+
+    def transform(self, X):
+        return np.subtract(X, self.baseline_)
+    
+
+class ArrayFilter(BaseEstimator, TransformerMixin):
+    """
+    If output is used directly on classifier, function transformer to reshape data needs to be used.
+    """
+    def __init__(self, sfreq, lfreq, hfreq):
+        self.sfreq = sfreq
+        self.lfreq = lfreq
+        self.hfreq = hfreq
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        b, a = butter(
+        N=4,
+        Wn=[self.lfreq, self.hfreq],
+        btype='bandpass',
+        fs=self.sfreq
+        )
+
+        X_filt = lfilter(b, a, X, axis=-1)
+
+        return np.array(X_filt)
+
+class PSD(BaseEstimator, TransformerMixin):
+    """
+    If output is used directly on classifier, function transformer to reshape data needs to be used.
+    """
+    def __init__(self, sfreq, fmin=0, fmax=None):
+        self.sfreq = sfreq
+        self.fmin = fmin
+        self.fmax = fmax
+
+    def fit (self, X, y=None):
+        return self
+
+    def transform(self, X):
+        
+        fmax = self.fmax if self.fmax is not None else self.sfreq / 2
+
+        n_seg = int(len(X[0, 0, :])/2)
+        if n_seg > 256:
+            n_fft = n_seg
+        else:
+            n_fft = 256
+
+        psds, _ = mne.time_frequency.psd_array_welch(X, 
+                                                     sfreq=self.sfreq,
+                                                     fmin=self.fmin,
+                                                     fmax=self.fmax,
+                                                     n_per_seg=n_seg,
+                                                     n_fft=n_fft,
+                                                     average='mean')
+        
+        psds = np.array(psds)
+        
+        return psds
+
+"""
+deprecated
+
+class IdleDetection():
+    #Classifier for idle state detection.
+    def __init__(self, model, threshold=0.6):
+        self.threshold = threshold
+        self.model = model
+
+    def fit(self, X, y):
+        y_idle = (y != REST_LABEL).astype(int)
+        self.model.fit(X, y_idle)
+        return self
+
+    def is_idle(self, window):
+        p_idle = self.model.predict_proba(window)[0, 0]
+
+        if p_idle < self.threshold:
+            return 0, p_idle
+        else:
+            return 1, p_idle
+"""
+
+class PseudoOnlineEvaluation():
+    """
+    Evaluates windowed data in pseudo-online manner (simulating real time asynchronous BCI). It can be done within-session, evaluating only one session data, or inter-session, evaluating performance across sessions, without
+    breaking signal causality. 
+
+    Parameters:
+        dataset: MOABB dataset
+            Dataset to be used. It has to be a MOABB dataset object.
+        pipelines: dict
+            Sklearn pipelines dictionary, as used in MOABB.
+        method: string
+            Either 'within-session' or 'inter-session'.
+                within-session: trains models on first k windows, testing on the remaining ones.
+                inter-session: trains models on first k sessions, testing on the remaining ones; doesn't violate data causality.
+        wsize: float
+            Window size.
+        wstep: int
+            Distance between consecutive windows (start to start).
+        subjects: list
+            List of subjects to process.
+        ratio: float
+            Proportion of data to be used in training.
+        threshold: float
+            Confidence threshold for classification.
+        
+    """
+    def __init__(self, dataset, class_pipelines, method, wsize, wstep, subjects, idle_pipelines=None, two_stage=True, ratio=0.7, idle_threshold=0.6, task_threshold=0.6, no_run=False):
+        self.dataset = dataset
+        self.class_pipelines = class_pipelines
+        self.ratio = ratio
+        self.method = method
+        self.wsize = wsize
+        self.wstep = wstep
+        self.subjects = subjects
+        self.idle_threshold = idle_threshold
+        self.task_threshold = task_threshold
+        self.no_run = no_run
+        self.idle_pipelines = idle_pipelines
+        self.two_stage = two_stage
+        
+        self.results_ = []
+        self.model_results_ = []
+
+        if self.two_stage is True and self.idle_pipelines is None:
+            raise AttributeError("Evaluation is set to two stage but has no idle_pipeline")
+
+    def raw_concat(self, raw_list):
+        """
+        Auxiliary function for raw data concat.
+        """
+        if len(raw_list) == 0:
+            raise ValueError("Raw list is empty.")
+        elif len(raw_list) == 1:    #aqui, o raw de uma sessao pode ser constituido de 1 ou mais runs, por isso essa verificação
+            if type(raw_list[0]) != list:
+                return raw_list[0]
+            else:
+                return mne.concatenate_raws(raw_list[0])
+        else:
+            return mne.concatenate_raws(raw_list)
+        
+    def window_process(self, subject, sess, X_test, y_test, times_test):
+        # window processing loop
+        for window in range(len(X_test)):
+            window_start = times_test[window][0]
+            window_end = times_test[window][1]
+
+            pipe_window = np.array([X_test[window]])
+
+            """
+            t_start = time.perf_counter()
+
+            if (self.feature_pipeline != None):
+                feature_window = self.feature_pipeline.transform([X_test[window]])
+            else:
+                feature_window = np.array([X_test[window]])
+                idle_window = np.reshape(feature_window, (feature_window.shape[0], -1))
+
+            t_end = time.perf_counter()
+
+            t_transform = t_end - t_start
+            """
+
+            t_start = time.perf_counter()
+            
+            if self.two_stage is True:
+                for idle_name, idle_pipe in self.idle_pipelines.items():
+                    idle_proba = idle_pipe.predict_proba(pipe_window)[0, 0]
+
+                    is_idle = 0 if idle_proba < self.idle_threshold else 1
+
+                    t_end = time.perf_counter()
+                    t_idle_detect = t_end - t_start
+
+                    task_proba = None
+
+                    if not is_idle:
+                        for name, pipe in self.class_pipelines.items():
+                            t_start = time.perf_counter()
+
+                            probs = pipe.predict_proba(pipe_window)[0]
+
+                            task_proba = np.max(probs)
+
+                            if task_proba < self.task_threshold:
+                                y_pred = REJECT_LABEL
+                            else:
+                                y_pred = probs.argmax()
+
+                            t_end = time.perf_counter()
+
+                            t_task_predict = t_end - t_start
+
+                            correct = (y_pred == y_test[window])
+
+                            res = {
+                                "dataset": self.dataset,
+                                "subject": subject,
+                                "session": sess,
+                                "method": self.method,
+                                "idle_pipeline": idle_name,
+                                "task_pipeline": name,
+                                "window": window,
+                                "window_start": window_start,
+                                "window_end": window_end,
+                                "is_idle": is_idle,
+                                "t_idle_detect": t_idle_detect,
+                                "t_task_predict": t_task_predict,
+                                "t_predict": (t_idle_detect + t_task_predict),
+                                "y_pred": y_pred,
+                                "idle_proba": idle_proba,
+                                "task_proba": task_proba,
+                                "y_true": y_test[window],
+                                "correct": correct
+                            }
+
+                            self.results_.append(res)
+                    else:
+                        y_pred = REST_LABEL
+                        t_task_predict = 0
+                        correct = (y_pred == y_test[window])
+
+                        res = {
+                            "dataset": self.dataset,
+                            "subject": subject,
+                            "session": sess,
+                            "method": self.method,
+                            "idle_pipeline": idle_name,
+                            "task_pipeline": None,
+                            "window": window,
+                            "window_start": window_start,
+                            "window_end": window_end,
+                            "is_idle": is_idle,
+                            "t_idle_detect": t_idle_detect,
+                            "t_task_predict": t_task_predict,
+                            "t_predict": (t_idle_detect + t_task_predict),
+                            "y_pred": y_pred,
+                            "idle_proba": idle_proba,
+                            "task_proba": task_proba,
+                            "y_true": y_test[window],
+                            "correct": correct
+                        }
+
+                        self.results_.append(res)
+            else:
+                for name, pipe in self.class_pipelines.items():
+                    t_start = time.perf_counter()
+
+                    probs = pipe.predict_proba(pipe_window)[0]
+
+                    task_proba = np.max(probs)
+                    idle_proba = probs[0]
+
+                    if task_proba < self.task_threshold:
+                        y_pred = REJECT_LABEL
+                    else:
+                        y_pred = probs.argmax()
+
+                    t_end = time.perf_counter()
+
+                    t_task_predict = t_end - t_start
+
+                    correct = (y_pred == y_test[window])
+
+                    res = {
+                        "dataset": self.dataset,
+                        "subject": subject,
+                        "session": sess,
+                        "method": self.method,
+                        "idle_pipeline": name,
+                        "task_pipeline": name,
+                        "window": window,
+                        "window_start": window_start,
+                        "window_end": window_end,
+                        "is_idle": int(y_pred == REST_LABEL),
+                        "t_idle_detect": t_task_predict if y_pred == REST_LABEL else None,
+                        "t_task_predict": t_task_predict,
+                        "t_predict": t_task_predict,
+                        "y_pred": y_pred,
+                        "idle_proba": idle_proba,
+                        "task_proba": task_proba,
+                        "y_true": y_test[window],
+                        "correct": correct
+                    }
+
+                    self.results_.append(res)
+
+    def idle_train(self, X_train, y_train):
+        y_idle = (y_train == REST_LABEL).astype(int)
+
+        for name, pipe in self.idle_pipelines.items():
+            print(f"fitting idle pipeline {name}...")
+
+            t_start = time.perf_counter()
+            pipe.fit(X_train, y_idle)
+            t_end = time.perf_counter()
+
+            t_idle_train = t_end - t_start
+
+            res = {
+                "idle_pipeline": name,
+                "method": self.method,
+                "t_train": t_idle_train
+                
+            }
+
+            self.model_results_.append(res)
+
+            print("done fitting idle detector")
+        return self
+
+    def task_train(self, X_train, y_train):
+        if self.two_stage is True:
+            # mask for task windows
+            mask = y_train != REST_LABEL
+            X_task = X_train[mask]
+            y_task = y_train[mask]
+        else:
+            X_task = X_train
+            y_task = y_train
+
+        # task classifier training
+        for name, pipe in self.class_pipelines.items():
+            print(f"Fitting task pipeline {name}...")
+            t_start = time.perf_counter()
+            pipe.fit(X_task, y_task)
+            t_end = time.perf_counter()
+
+            t_train = t_end - t_start
+            print("Done fitting!")
+
+            res = {
+                "task_pipeline": name,
+                "method": self.method,
+                "t_train": t_train
+                
+            }
+
+            self.model_results_.append(res)
+
+        return self
+
+
+    def evaluate(self):
+        """
+        Main function for processing data.
+        """
+
+        for subject in self.subjects:
+            if subject not in self.dataset.subject_list:
+                raise ValueError(f"Invalid subject index: {subject}")
+            else:
+                print(f"Processing subject {subject}...")
+
+                raws_dict = {}
+                raws_test = {}
+                pre = self.dataset.get_data(subjects=[subject])
+                
+                session_keys = []   # stores session ids (not always int)
+
+                if self.method == 'within-session':
+                    
+                    # raw extraction from moabb dataset
+                    for _, runs in pre.items():
+                        for sess, dicts in runs.items():
+                            session_keys.append(sess)
+                            raws_dict[sess] = []
+                            for _, data in dicts.items():
+                                raws_dict[sess].append(data)
+                    
+                    for sess in session_keys:
+                        print(f"Processing session {sess} subject {subject}...")
+                        raw = self.raw_concat(raws_dict[sess])
+                        events, event_ids = mne.events_from_annotations(raw)
+
+                        wgen = PseudoOnlineWindow(raw=raw,
+                                                events=events,
+                                                interval=self.dataset.interval,
+                                                task_ids=event_ids,
+                                                window_size=self.wsize,
+                                                window_step=self.wstep
+                                                )
+                        
+                        X, y, times = wgen.generate_windows()
+
+                        idx_split = int(len(X) * self.ratio)
+
+                        times_test = times[idx_split:]
+
+                        X_train, y_train = X[:idx_split], y[:idx_split]
+                        X_test, y_test = X[idx_split:], y[idx_split:]
+
+                        if (self.no_run):
+                            return X_train, y_train, X_test, y_test
+                        
+                        if self.two_stage is True:
+                            self.idle_train(X_train, y_train)
+
+                        self.task_train(X_train, y_train)
+
+                        self.window_process(subject, sess, X_test, y_test, times_test)
+            
+            
+                elif self.method == 'inter-session':
+                    if self.dataset.n_sessions > 1:
+                        session_split = int(self.ratio * self.dataset.n_sessions)
+                        raws_list = []
+                        raws_train = []
+
+                        print(f"Splitting index is {session_split}, dataset has {self.dataset.n_sessions} sessions per subject.")
+
+                        for _, runs in pre.items():
+                            for sess, dicts in runs.items():
+                                session_keys.append(sess)
+                                raws_test[sess] = []
+                                raws_dict[sess] = []
+                                for _, data in dicts.items():
+                                    raws_dict[sess].append(data)
+                        
+                        #essa verificação é porque eu acahva que o int() arredondava pra cima o valor... de todo jeito, nao faz mal deixar isso aqui
+                        if session_split == self.dataset.n_sessions:
+                            train_sessions = session_keys[:(session_split - 1)]
+                            test_sessions = session_keys[(session_split - 1):]
+                            for sess, data in raws_dict.items():
+                                if (session_keys.index(sess) + 1) < session_split:
+                                    raws_list.append(data)
+                                else:
+                                    raws_test[sess].append(data)
+                        else:
+                            train_sessions = session_keys[:session_split]
+                            test_sessions = session_keys[session_split:]
+                            for sess, data in raws_dict.items():
+                                if (session_keys.index(sess) + 1) <= session_split:
+                                    raws_list.append(data)
+                                else:
+                                    raws_test[sess].append(data)
+                        
+                        
+                        raws_train = self.raw_concat(raws_list)
+
+                        events, event_ids = mne.events_from_annotations(raws_train)
+
+                        wgen_train = PseudoOnlineWindow(raw=raws_train,
+                                                            events=events,
+                                                            interval=self.dataset.interval,
+                                                            task_ids=event_ids,
+                                                            window_size=self.wsize,
+                                                            window_step=self.wstep
+                                                            )
+
+                        X_train, y_train, times_train = wgen_train.generate_windows()
+
+                        if (self.no_run):
+                            return X_train, y_train, X_test, y_test
+                        
+                        if self.two_stage is True:
+                            self.idle_train(X_train, y_train)
+
+                        self.task_train(X_train, y_train)
+                            
+                        for sess in test_sessions:
+                            print(f"Testing in session {sess}...")
+
+                            raws = self.raw_concat(raws_test[sess])
+
+                            events, event_ids = mne.events_from_annotations(raws)
+
+                            wgen_test = PseudoOnlineWindow(raw=raws,
+                                                                events=events,
+                                                                interval=self.dataset.interval,
+                                                                task_ids=event_ids,
+                                                                window_size=self.wsize,
+                                                                window_step=self.wstep
+                                                                )
+                                
+                            X_test, y_test, times_test = wgen_test.generate_windows()
+
+                            self.window_process(subject, sess, X_test, y_test, times_test)
+                    else:
+                        raise ValueError("There are not enough sessions for evaluation.")
+                    
+            if len(self.results_):
+                results_ = pd.DataFrame(self.results_)
+                results_.to_csv(f"results-S{subject}.csv", index=False)
+                self.results_ = []
+            if len(self.model_results_):
+                model_results_ = pd.DataFrame(self.model_results_)
+                model_results_.to_csv(f"model-results-S{subject}.csv", index=False)
+                self.model_results_ = []
+
+
+
+            
+                                   # mcc_acc_sess = matthews_corrcoef(y_test[:window+1], predictions_sess[:window+1])    #score acumulado dentro da sessão
+                                   # mcc_acc = matthews_corrcoef(y_all, predictions)   #score acumulado entre sessões
