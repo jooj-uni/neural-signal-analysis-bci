@@ -16,16 +16,11 @@ def load_results_with_checkpoints(prefix: str = RESULTS_PREFIX) -> pd.DataFrame:
     cujo nome começa com `prefix` e termina em .csv,
     concatena e remove linhas duplicadas.
     """
-    cwd = os.getcwd()
-    csv_files = [
-        fname for fname in os.listdir(cwd)
-        if fname.startswith(prefix) and fname.endswith(".csv")
-    ]
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    csv_files = [fname for fname in os.listdir(cwd) if fname.startswith(prefix) and fname.endswith(".csv")]
 
     if not csv_files:
-        raise FileNotFoundError(
-            f"Nenhum CSV encontrado com prefixo '{prefix}' em {cwd}"
-        )
+        raise FileNotFoundError(f"Nenhum CSV encontrado com prefixo '{prefix}' em {cwd}")
 
     dfs = []
     print("[INFO] Arquivos encontrados para agregação:")
@@ -64,9 +59,7 @@ df = load_results_with_checkpoints(RESULTS_PREFIX)
 required = {"pipeline", "subject", "session", "score"}
 missing  = required - set(df.columns)
 if missing:
-    raise ValueError(
-        f"CSV precisa conter: {sorted(required)}; faltam: {sorted(missing)}"
-    )
+    raise ValueError(f"CSV precisa conter: {sorted(required)}; faltam: {sorted(missing)}")
 
 df["subject"] = df["subject"].astype(int)
 df["session"] = df["session"].astype(int)
@@ -78,27 +71,11 @@ sess  = sorted(df["session"].unique())
 # -----------------------
 # AGREGAÇÕES
 # -----------------------
-g_pipe = (
-    df.groupby("pipeline")["score"]
-      .agg(["mean", "std", "count"])
-      .reindex(pipes)
-)
+g_pipe = (df.groupby("pipeline")["score"].agg(["mean", "std", "count"]).reindex(pipes))
 g_pipe.to_csv("summary_by_pipeline.csv", index=True)
 
-piv_sp = (
-    df.pivot_table(values="score",
-                   index="subject",
-                   columns="pipeline",
-                   aggfunc=np.nanmean)
-      .reindex(index=subjs, columns=pipes)
-)
-piv_ep = (
-    df.pivot_table(values="score",
-                   index="session",
-                   columns="pipeline",
-                   aggfunc=np.nanmean)
-      .reindex(index=sess, columns=pipes)
-)
+piv_sp = (df.pivot_table(values="score",index="subject",columns="pipeline",aggfunc=np.nanmean).reindex(index=subjs, columns=pipes))
+piv_ep = (df.pivot_table(values="score",index="session",columns="pipeline",aggfunc=np.nanmean).reindex(index=sess, columns=pipes))
 
 # -----------------------
 # FUNÇÕES AUXILIARES
@@ -131,12 +108,7 @@ def heatmap(ax, M, xticks, yticks, title, xlabel, ylabel, vmin=0.0, vmax=1.0):
 # -----------------------
 np.random.seed(0)
 fig        = plt.figure(figsize=(20, 18))
-gs         = fig.add_gridspec(
-    2, 4,
-    width_ratios=[1.2, 1, 1, 1.2],
-    height_ratios=[1, 1],
-    hspace=0.35, wspace=0.35
-)
+gs         = fig.add_gridspec(2, 4,width_ratios=[1.2, 1, 1, 1.2], height_ratios=[1, 1],hspace=0.35, wspace=0.35)
 ax_hm_sp   = fig.add_subplot(gs[:, 0])  # span 2 linhas (esquerda)
 ax_bar     = fig.add_subplot(gs[0, 1])  # grade 2×2 (linha superior)
 ax_hm_ep   = fig.add_subplot(gs[0, 2])  # grade 2×2 (linha superior)
@@ -161,14 +133,10 @@ ax_bar.set_ylim(0.0, 1.0)
 ax_bar.axhline(CHANCE, linestyle="--", linewidth=1, color="k", alpha=0.8)
 
 # ---- (2) Heatmap: Sujeito × Pipeline ----
-heatmap(ax_hm_sp, piv_sp.values, pipes, subjs,
-        title="Sujeito × Pipeline (média)",
-        xlabel="Pipeline", ylabel="Sujeito")
+heatmap(ax_hm_sp, piv_sp.values, pipes, subjs,title="Sujeito × Pipeline (média)",xlabel="Pipeline", ylabel="Sujeito")
 
 # ---- (3) Heatmap: Sessão × Pipeline ----
-heatmap(ax_hm_ep, piv_ep.values, pipes, sess,
-        title="Sessão × Pipeline (média)",
-        xlabel="Pipeline", ylabel="Sessão")
+heatmap(ax_hm_ep, piv_ep.values, pipes, sess,title="Sessão × Pipeline (média)",xlabel="Pipeline", ylabel="Sessão")
 
 # ---- (4) Linhas: evolução por sessão (média ± IC95%) ----
 color_list = list(plt.get_cmap("tab20").colors)  # 20 cores distintas
@@ -191,10 +159,7 @@ ax_lines.set_ylim(0.0, 1.0)
 ax_lines.axhline(CHANCE, linestyle="--", linewidth=1, color="k", alpha=0.8)
 
 # ---- (5) Boxplot por pipeline ----
-data_per_pipe = [
-    df.loc[df["pipeline"] == p, "score"].dropna().to_numpy()
-    for p in pipes
-]
+data_per_pipe = [df.loc[df["pipeline"] == p, "score"].dropna().to_numpy() for p in pipes]
 ax_box.boxplot(data_per_pipe, labels=pipes, showmeans=True)
 ax_box.set_xticklabels(pipes, rotation=90, ha="right", fontsize=8)
 ax_box.set_ylabel("Accuracy")
@@ -205,41 +170,21 @@ ax_box.axhline(CHANCE, linestyle="--", linewidth=1, color="k", alpha=0.8)
 # ---- (6) Heatmap: Sujeito × Sessão (melhor pipeline) ----
 best_pipe  = g_pipe["mean"].idxmax()
 df_best    = df[df["pipeline"] == best_pipe]
-subj_order = (
-    df_best.groupby("subject")["score"]
-           .mean()
-           .sort_values(ascending=False)
-           .index
-           .tolist()
-)
-piv_best   = (
-    df_best.pivot_table(values="score",
-                        index="subject",
-                        columns="session",
-                        aggfunc=np.nanmean)
-           .reindex(index=subj_order, columns=sess)
-)
+subj_order = (df_best.groupby("subject")["score"].mean().sort_values(ascending=False).index.tolist())
+piv_best   = (df_best.pivot_table(values="score",index="subject",columns="session",aggfunc=np.nanmean).reindex(index=subj_order, columns=sess))
 
-heatmap(ax_hm_best,
-        piv_best.values,
-        sess,
-        subj_order,
-        title=f"[BEST] {best_pipe}: Sujeito × Sessão",
+heatmap(ax_hm_best,piv_best.values,
+        sess,subj_order,title=f"[BEST] {best_pipe}: Sujeito × Sessão",
         xlabel="Sessão", ylabel="Sujeito")
 
 # ---- Título e salvamento da figura principal ----
-fig.suptitle("Stieger2021 — Comparações: pipeline / sujeito / sessão (NaN-safe)",
-             fontsize=16)
+fig.suptitle("Stieger2021 — Comparações: pipeline / sujeito / sessão (NaN-safe)",fontsize=16)
 out_path = os.path.join(os.getcwd(), "results_overview_with_best_pipeline.pdf")
 plt.savefig(out_path, dpi=150)
 
 # ---- (7) Tempo médio por pipeline (figura separada) ----
 if "time" in df.columns:
-    g_time = (
-        df.groupby("pipeline")["time"]
-          .agg(["mean", "std", "count"])
-          .reindex(pipes)
-    )
+    g_time = (df.groupby("pipeline")["time"].agg(["mean", "std", "count"]).reindex(pipes))
 
     fig_time, ax_time = plt.subplots(figsize=(8, 5))
 
