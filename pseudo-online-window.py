@@ -170,15 +170,12 @@ class ArrayFilter(BaseEstimator, TransformerMixin):
     """
     If output is used directly on classifier, function transformer to reshape data needs to be used.
     """
-    def __init__(self, sfreq, lfreq, hfreq):
+    def __init__(self, sfreq, lfreq=1, hfreq=100):
         self.sfreq = sfreq
         self.lfreq = lfreq
         self.hfreq = hfreq
 
     def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
         b, a = butter(
         N=4,
         Wn=[self.lfreq, self.hfreq],
@@ -186,7 +183,13 @@ class ArrayFilter(BaseEstimator, TransformerMixin):
         fs=self.sfreq
         )
 
-        X_filt = lfilter(b, a, X, axis=-1)
+        self.a_ = a
+        self.b_ = b
+
+        return self
+
+    def transform(self, X):
+        X_filt = lfilter(self.b_, self.a_, X, axis=-1)
 
         return np.array(X_filt)
 
@@ -341,6 +344,7 @@ class PseudoOnlineEvaluation():
                     t_idle_detect = t_end - t_start
 
                     task_proba = None
+                    probs = None
 
                     if not is_idle:
                         for name, pipe in self.class_pipelines.items():
@@ -353,13 +357,15 @@ class PseudoOnlineEvaluation():
                             if task_proba < self.task_threshold:
                                 y_pred = REJECT_LABEL
                             else:
-                                y_pred = probs.argmax()
+                                y_pred = (probs.argmax() + 1) # como o idle eh 0, nessa lista o idx 0 representa a task 1; tem um offset nos labels
 
                             t_end = time.perf_counter()
 
                             t_task_predict = t_end - t_start
 
                             correct = (y_pred == y_test[window])
+
+                            correct_proba = probs[(y_test[window] - 1)] if y_test[window] != REST_LABEL else idle_proba
 
                             res = {
                                 "dataset": self.dataset,
@@ -369,6 +375,8 @@ class PseudoOnlineEvaluation():
                                 "idle_pipeline": idle_name,
                                 "task_pipeline": name,
                                 "window": window,
+                                "wsize": self.wsize,
+                                "wstep": self.wstep,
                                 "window_start": window_start,
                                 "window_end": window_end,
                                 "is_idle": is_idle,
@@ -378,6 +386,7 @@ class PseudoOnlineEvaluation():
                                 "y_pred": y_pred,
                                 "idle_proba": idle_proba,
                                 "task_proba": task_proba,
+                                "cor_proba": correct_proba,
                                 "y_true": y_test[window],
                                 "correct": correct
                             }
@@ -388,6 +397,7 @@ class PseudoOnlineEvaluation():
                         t_task_predict = 0
                         correct = (y_pred == y_test[window])
 
+
                         res = {
                             "dataset": self.dataset,
                             "subject": subject,
@@ -396,6 +406,8 @@ class PseudoOnlineEvaluation():
                             "idle_pipeline": idle_name,
                             "task_pipeline": None,
                             "window": window,
+                            "wsize": self.wsize,
+                            "wstep": self.wstep,
                             "window_start": window_start,
                             "window_end": window_end,
                             "is_idle": is_idle,
@@ -405,6 +417,7 @@ class PseudoOnlineEvaluation():
                             "y_pred": y_pred,
                             "idle_proba": idle_proba,
                             "task_proba": task_proba,
+                            "cor_proba": None,
                             "y_true": y_test[window],
                             "correct": correct
                         }
@@ -455,6 +468,11 @@ class PseudoOnlineEvaluation():
 
     def idle_train(self, X_train, y_train):
         y_idle = (y_train == REST_LABEL).astype(int)
+
+        p1 = len(y_idle[y_idle == 1])
+        p2 = len(y_idle[y_idle == 0])
+
+        print(f"idle qtd: {p1}, task qtd: {p2}")
 
         for name, pipe in self.idle_pipelines.items():
             print(f"fitting idle pipeline {name}...")
@@ -565,6 +583,9 @@ class PseudoOnlineEvaluation():
                             self.idle_train(X_train, y_train)
 
                         self.task_train(X_train, y_train)
+
+                        self.task_threshold = ((1/len(np.unique(y_train[y_train != REST_LABEL]))) + 0.05)
+                        print(f"task threshold is {self.task_threshold}")
 
                         self.window_process(subject, sess, X_test, y_test, times_test)
             
